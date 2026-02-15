@@ -1,0 +1,307 @@
+## =============================================================
+## TCGA-BRCA | ENPP1 | PFI-only survival (Cox + KM) 
+##   - TNBC (IHC-derived) + PAM50 subtypes
+##   - Primary tumor RNA only (TCGA sample type "01")
+##   - PFI from TCGA_PanCan_Survival.tsv (days -> months)
+## =============================================================
+
+suppressPackageStartupMessages({
+  pkgs <- c("data.table", "dplyr", "stringr", "tibble", "survival", "survminer")
+  miss <- pkgs[!vapply(pkgs, requireNamespace, logical(1), quietly = TRUE)]
+  if (length(miss)) stop("Missing packages: ", paste(miss, collapse = ", "),
+                         "\nInstall them first, e.g. install.packages(c(...))")
+  lapply(pkgs, library, character.only = TRUE)
+})
+
+## ------------------------- user config -------------------------
+datadir <- "~/Desktop/cbio_brca"
+outdir  <- file.path(datadir, "PFI_ENPP1_by_subtype_pdf")
+dir.create(outdir, showWarnings = FALSE, recursive = TRUE)
+
+files <- list(
+  expr   = file.path(datadir, "data_mrna_seq_v2_rsem.txt"),
+  pam50  = file.path(datadir, "PAM50.txt"),
+  cm     = file.path(datadir, "TCGA_BRCA_clinicalMatrix.tsv"),
+  pancan = file.path(datadir, "brca_tcga_pan_can_atlas_2018_clinical_data.tsv"),
+  pfi    = file.path(datadir, "TCGA_PanCan_Survival.tsv")
+)
+
+stopifnot(file.exists(files$expr), file.exists(files$pam50),
+          file.exists(files$pfi), file.exists(files$pancan))
+
+## ------------------------- helpers -------------------------
+to_up <- function(x) toupper(trimws(as.character(x)))
+norm_names <- function(x){
+  x <- toupper(x)
+  x <- gsub("[^A-Z0-9]+","_", x)
+  gsub("^_|_$","", x)
+}
+pick_col <- function(df, patterns){
+  nm <- names(df)
+  for (p in patterns){
+    hit <- nm[grepl(p, nm, perl = TRUE)]
+    if (length(hit)) return(hit[1])
+  }
+  NA_character_
+}
+is_neg <- function(v){
+  s <- to_up(v)
+  ifelse(grepl("NEG|NOT[_ ]?AMP(LIFIED)?|\\b0\\b", s), TRUE,
+         ifelse(grepl("POS|AMP(LIFIED)?|\\b1\\b|POSITIVE", s), FALSE, NA))
+}
+first_non_na <- function(x){
+  y <- x[!is.na(x)]
+  if (length(y)) y[1] else NA
+}
+open_pdf <- function(file, width = 6.8, height = 6.8) {
+  if (isTRUE(capabilities("cairo"))) {
+    ok <- try(suppressWarnings(grDevices::cairo_pdf(file, width = width, height = height)),
+              silent = TRUE)
+    if (!inherits(ok, "try-error")) return(invisible(TRUE))
+  }
+  grDevices::pdf(file, width = width, height = height)
+}
+
+## ------------------------- 1) ENPP1 expression (primary tumor) -------------------------
+read_enpp1_primary <- function(expr_file){
+  expr <- data.table::fread(expr_file, data.table = FALSE, check.names = FALSE)
+  colnames(expr)[1] <- "gene"
+
+  # sample columns: keep TCGA barcodes; convert '.' -> '-'
+  bar_all <- gsub("\\.", "-", colnames(expr))
+  sample_cols <- colnames(expr)[grepl("^TCGA-", bar_all)]
+  if (!length(sample_cols)) {
+    non_sample <- intersect(colnames(expr), c("gene","HUGO_SYMBOL","ENTREZ_GENE_ID"))
+    sample_cols <- setdiff(colnames(expr), non_sample)
+  }
+
+  bars <- gsub("\\.", "-", sample_cols)
+  is_primary <- substr(bars, 14, 15) == "01"
+  sample_cols <- sample_cols[is_primary]
+  bars <- bars[is_primary]
+  if (!length(sample_cols)) stop("No primary tumor (01) samples found in expression file.")
+
+  idx <- which(toupper(expr$gene) == "ENPP1")
+  if (length(idx) != 1) stop("ENPP1 row not found uniquely in expression matrix.")
+
+  vals <- as.numeric(as.matrix(expr[idx, sample_cols, drop = FALSE]))
+  tibble(
+    patient_id = substr(bars, 1, 12),
+    ENPP1_log2 = log2(vals + 1)
+  ) %>%
+    group_by(patient_id) %>%
+    summarise(ENPP1_log2 = first(ENPP1_log2), .groups = "drop")
+}
+
+enpp1_tbl <- read_enpp1_primary(files$expr)
+
+## ------------------------- 2) PAM50 subtype -------------------------
+read_pam50 <- function(pam50_file){
+  pam <- data.table::fread(pam50_file, sep = "\t", data.table = FALSE)
+  # expected columns: Sample, Type, PAM50 (as in your file)
+  tibble(
+    patient_id = substr(gsub("\\.", "-", pam$Sample), 1, 12),
+    Type = tolower(trimws(pam$Type)),
+    PAM50_subtype = dplyr::case_when(
+      toupper(pam$PAM50) == "LUMA"  ~ "Luminal A",
+      toupper(pam$PAM50) == "LUMB"  ~ "Luminal B",
+      toupper(pam$PAM50) == "HER2"  ~ "HER2",
+      toupper(pam$PAM50) == "BASAL" ~ "Basal",
+      TRUE ~ NA_character_
+    )
+  ) %>%
+    filter(!is.na(PAM50_subtype)) %>%
+    mutate(priority = ifelse(Type == "tumor", 1, 2)) %>%
+    arrange(patient_id, priority) %>%
+    group_by(patient_id) %>%
+    summarise(PAM50_subtype = first(PAM50_subtype), .groups = "drop")
+}
+
+pam_tab <- read_pam50(files$pam50)
+
+## ------------------------- 3) TNBC flag from IHC receptors -------------------------
+tnbc_from_clinicalMatrix <- function(cm_file){
+  cm <- data.table::fread(cm_file, data.table = FALSE)
+  names(cm) <- norm_names(names(cm))
+  if (!"SAMPLE" %in% names(cm)) names(cm)[1] <- "SAMPLE"
+
+  erc <- names(cm)[grepl("^ER(_STATUS.*|_STATUS_BY_IHC$|$)", names(cm))][1]
+  prc <- names(cm)[grepl("^PR(_STATUS.*|_STATUS_BY_IHC$|$)", names(cm))][1]
+  h2c <- names(cm)[grepl("^HER2(_.*STATUS|_STATUS_BY_IHC$|_FINAL_STATUS$|_OVERALL_STATUS$|$)", names(cm))][1]
+  if (any(is.na(c(erc, prc, h2c)))) return(NULL)
+
+  tibble(
+    patient_id = substr(gsub("\\.", "-", cm$SAMPLE), 1, 12),
+    ER_neg   = is_neg(cm[[erc]]),
+    PR_neg   = is_neg(cm[[prc]]),
+    HER2_neg = is_neg(cm[[h2c]])
+  ) %>%
+    mutate(TNBC_flag = ifelse(ER_neg & PR_neg & HER2_neg, "TNBC", NA_character_)) %>%
+    select(patient_id, TNBC_flag)
+}
+
+tnbc_from_panCan <- function(pancan_file){
+  df <- data.table::fread(pancan_file, sep = "\t", quote = "", data.table = FALSE,
+                          na.strings = c("", "NA", "NaN"))
+  names(df) <- norm_names(names(df))
+
+  erc <- pick_col(df, c("^ER_STATUS_BY_IHC$","^ER_.*STATUS"))
+  prc <- pick_col(df, c("^PR_STATUS_BY_IHC$","^PR_.*STATUS"))
+  h2c <- pick_col(df, c("^HER2_STATUS_BY_IHC$","^HER2_FINAL_STATUS$","^HER2_.*STATUS"))
+  pat <- pick_col(df, c("^PATIENT_IDENTIFIER$","^BCR_PATIENT_BARCODE$","^PATIENT_ID$"))
+  if (any(is.na(c(erc, prc, h2c, pat)))) return(NULL)
+
+  tibble(
+    patient_id = substr(toupper(df[[pat]]), 1, 12),
+    ER_neg   = is_neg(df[[erc]]),
+    PR_neg   = is_neg(df[[prc]]),
+    HER2_neg = is_neg(df[[h2c]])
+  ) %>%
+    mutate(TNBC_flag = ifelse(ER_neg & PR_neg & HER2_neg, "TNBC", NA_character_)) %>%
+    select(patient_id, TNBC_flag)
+}
+
+tnbc_tbl <- NULL
+if (file.exists(files$cm)) tnbc_tbl <- tnbc_from_clinicalMatrix(files$cm)
+if (is.null(tnbc_tbl))     tnbc_tbl <- tnbc_from_panCan(files$pancan)
+if (is.null(tnbc_tbl)) stop("TNBC derivation failed: receptor columns not found.")
+
+message("TNBC patients flagged: ", sum(tnbc_tbl$TNBC_flag == "TNBC", na.rm = TRUE))
+
+## ------------------------- 4) Covariates: age + stage -------------------------
+read_covariates <- function(pancan_file){
+  df <- data.table::fread(pancan_file, sep = "\t", quote = "", data.table = FALSE,
+                          na.strings = c("", "NA", "NaN"))
+  names(df) <- norm_names(names(df))
+
+  id  <- pick_col(df, c("^PATIENT_IDENTIFIER$","^BCR_PATIENT_BARCODE$","^PATIENT_ID$"))
+  age <- pick_col(df, c("^DIAGNOSIS_AGE$","^AGE_AT_INITIAL_PATHOLOGIC_DIAGNOSIS$"))
+  stg <- pick_col(df, c("^AJCC_PATHOLOGIC_TUMOR_STAGE$","^PATHOLOGIC_STAGE$","NEOPLASM_DISEASE_STAGE"))
+
+  if (is.na(id)) stop("Cannot find patient ID column in pancan clinical file.")
+
+  tibble(
+    patient_id = substr(toupper(df[[id]]), 1, 12),
+    age_dx    = if (!is.na(age)) suppressWarnings(as.numeric(df[[age]])) else NA_real_,
+    stage_raw = if (!is.na(stg)) as.character(df[[stg]]) else NA_character_
+  ) %>%
+    group_by(patient_id) %>%
+    summarise(
+      age_dx = first_non_na(age_dx),
+      stage_raw = first_non_na(stage_raw),
+      .groups = "drop"
+    ) %>%
+    mutate(
+      stage = case_when(
+        grepl("IV",  to_up(stage_raw)) ~ "IV",
+        grepl("III", to_up(stage_raw)) ~ "III",
+        grepl("II",  to_up(stage_raw)) ~ "II",
+        grepl("I",   to_up(stage_raw)) ~ "I",
+        TRUE ~ NA_character_
+      ),
+      stage = factor(stage, levels = c("I","II","III","IV"), ordered = FALSE)
+    ) %>%
+    select(patient_id, age_dx, stage)
+}
+
+covs <- read_covariates(files$pancan)
+
+## ------------------------- 5) PFI (PanCan survival table) -------------------------
+read_pfi <- function(pfi_file){
+  s <- data.table::fread(pfi_file, data.table = FALSE)
+  stopifnot(all(c("sample", "PFI", "PFI.time") %in% colnames(s)))
+
+  tibble(
+    patient_id = substr(gsub("\\.", "-", s$sample), 1, 12),
+    PFI_event  = as.integer(s$PFI),
+    PFI_time   = as.numeric(s$`PFI.time`) / 30.44  # days -> months
+  ) %>%
+    filter(!is.na(PFI_time), !is.na(PFI_event)) %>%
+    arrange(patient_id, desc(PFI_event), desc(PFI_time)) %>%
+    group_by(patient_id) %>%
+    summarise(
+      PFI_event = first(PFI_event),
+      PFI_time  = first(PFI_time),
+      .groups = "drop"
+    )
+}
+
+pfi_tbl <- read_pfi(files$pfi)
+
+## ------------------------- 6) Build analysis table -------------------------
+dat <- enpp1_tbl %>%
+  left_join(pam_tab,  by = "patient_id") %>%
+  left_join(tnbc_tbl, by = "patient_id") %>%
+  left_join(covs,     by = "patient_id") %>%
+  left_join(pfi_tbl,  by = "patient_id") %>%
+  filter(!is.na(PFI_time), !is.na(PFI_event), !is.na(ENPP1_log2))
+
+message("Total patients with ENPP1 + PFI: ", nrow(dat))
+message("PFI events: ", sum(dat$PFI_event == 1), " / ", nrow(dat))
+
+## ------------------------- 7) Cox + KM function (Q4 vs Q1–Q3) -------------------------
+fit_pfi_models <- function(d, label, outdir, min_n = 20){
+  d <- d %>% filter(!is.na(ENPP1_log2), !is.na(PFI_time), !is.na(PFI_event))
+
+  if (nrow(d) < min_n) {
+    message(label, ": n<", min_n, " (n=", nrow(d), "), skip.")
+    return(invisible(NULL))
+  }
+
+  # Cox: scaled continuous ENPP1 + covariates
+  m <- survival::coxph(survival::Surv(PFI_time, PFI_event) ~ scale(ENPP1_log2) + age_dx + stage, data = d)
+
+  # KM: Q4 vs Q1-Q3
+  q75 <- stats::quantile(d$ENPP1_log2, 0.75, na.rm = TRUE)
+  d$grp_q75 <- ifelse(d$ENPP1_log2 >= q75, "ENPP1 High (Q4)", "Q1-Q3")
+  if (dplyr::n_distinct(d$grp_q75) < 2) {
+    message(label, ": only one group after Q4 cut, skip KM.")
+    return(invisible(list(cox = m, km = NULL)))
+  }
+
+  fit <- survival::survfit(survival::Surv(PFI_time, PFI_event) ~ grp_q75, data = d)
+  g <- survminer::ggsurvplot(
+    fit, data = d,
+    risk.table = TRUE, pval = TRUE,
+    conf.int = FALSE, linetype = 1,
+    legend.title = "",
+    risk.table.height = 0.25,
+    title = paste0(label, " - PFI: ENPP1 Q4 vs Q1-Q3 (cut=", round(q75, 3), ")"),
+    xlab = "Months", ylab = "Progression-free probability"
+  )
+
+  outfile <- file.path(outdir, paste0("TCGA_BRCA_", gsub("[^A-Za-z0-9]+","_", label),
+                                      "_PFI_ENPP1_Q4_vs_Q1Q3.pdf"))
+  open_pdf(outfile, width = 6.8, height = 6.8)
+  print(g)
+  grDevices::dev.off()
+
+  # return model objects (useful for RDS save if you want)
+  invisible(list(cox = m, km = fit, cut = q75, n = nrow(d), events = sum(d$PFI_event == 1)))
+}
+
+## ------------------------- 8) Run: TNBC + PAM50 -------------------------
+# TNBC
+tnbc_dat <- dat %>% filter(TNBC_flag == "TNBC")
+res_tnbc <- fit_pfi_models(tnbc_dat, "TNBC", outdir)
+
+if (!is.null(res_tnbc)) {
+  message("TNBC Cox summary:")
+  print(summary(res_tnbc$cox))
+  message("TNBC PH test:")
+  print(cox.zph(res_tnbc$cox))
+}
+
+# PAM50 subtypes
+subtypes <- c("Luminal A", "Luminal B", "HER2", "Basal")
+res_sub <- lapply(subtypes, function(st){
+  d <- dat %>% filter(PAM50_subtype == st)
+  fit_pfi_models(d, st, outdir)
+})
+names(res_sub) <- subtypes
+
+## optional: save model objects for reproducibility
+saveRDS(list(TNBC = res_tnbc, PAM50 = res_sub),
+        file = file.path(outdir, "PFI_models_ENPP1_TCGA_BRCA.rds"))
+
+message("Done. PDFs + RDS saved in: ", outdir)
