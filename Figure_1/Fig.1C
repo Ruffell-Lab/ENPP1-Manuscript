@@ -1,0 +1,131 @@
+############################################################
+## 0.Package installation
+############################################################
+
+packages <- c("data.table", "dplyr", "ggplot2", "ggVennDiagram")
+
+for (pkg in packages) {
+  if (!require(pkg, character.only = TRUE)) {
+    install.packages(pkg, repos = "https://cloud.r-project.org")
+    library(pkg, character.only = TRUE)
+  }
+}
+setwd("~/Desktop/ISPY2 updated")
+
+############################################################
+## 1. import files
+############################################################
+
+vc <- fread("VC_limma_results_nonpCR_vs_pCR.csv")
+pembro <- fread("Pembro_limma_results_nonpCR_vs_pCR.csv")
+durva <- fread("Durvalumab_Olaparib_limma_results_nonpCR_vs_pCR.csv")
+
+############################################################
+## 2.check columns
+############################################################
+
+colnames(vc)
+colnames(pembro)
+colnames(durva)
+
+
+############################################################
+## 3. Selection：non-pCR upregulation with stastical significant
+############################################################
+
+vc_up <- vc %>%
+  filter(logFC > 0, P.Value < 0.05) %>%
+  pull(gene)
+
+pembro_up <- pembro %>%
+  filter(logFC > 0, P.Value < 0.05) %>%
+  pull(gene)
+
+durva_up <- durva %>%
+  filter(logFC > 0, P.Value < 0.05) %>%
+  pull(gene)
+
+############################################################
+## 4. generate Venn
+############################################################
+
+gene_list <- list(
+  VC = vc_up,
+  Pembro = pembro_up,
+  Durva_Olaparib = durva_up
+)
+
+venn <- ggVennDiagram(gene_list, label_alpha = 0) +
+  scale_fill_gradient(low = "white", high = "#F8766D")
+
+ggsave("Venn_shared_up_genes.pdf", venn, width = 6, height = 6)
+
+############################################################
+## 5. find shared genes
+############################################################
+
+shared_genes <- Reduce(intersect, gene_list)
+
+length(shared_genes)
+
+############################################################
+## 6. extraction the information
+############################################################
+############################################################
+## VC
+############################################################
+vc_sub <- vc %>%
+  filter(.data[["gene"]] %in% shared_genes) %>%
+  select(
+    gene = .data[["gene"]],
+    VC_logFC = .data[["logFC"]],
+    VC_P = .data[["P.Value"]]
+  )
+
+############################################################
+## Pembro
+############################################################
+pembro_sub <- pembro %>%
+  filter(.data[["gene"]] %in% shared_genes) %>%
+  select(
+    gene = .data[["gene"]],
+    Pembro_logFC = .data[["logFC"]],
+    Pembro_P = .data[["P.Value"]]
+  )
+
+############################################################
+## Durva
+############################################################
+durva_sub <- durva %>%
+  filter(.data[["gene"]] %in% shared_genes) %>%
+  select(
+    gene = .data[["gene"]],
+    Durva_logFC = .data[["logFC"]],
+    Durva_P = .data[["P.Value"]]
+  )
+
+############################################################
+## 7. merge to one form
+############################################################
+
+shared_table <- vc_sub %>%
+  left_join(pembro_sub, by = "gene") %>%
+  left_join(durva_sub, by = "gene")
+
+############################################################
+## 8. Add max_logFC and min_P
+############################################################
+
+shared_table <- shared_table %>%
+  mutate(max_logFC = pmax(VC_logFC, Pembro_logFC, Durva_logFC),
+         min_p = pmin(VC_P, Pembro_P, Durva_P))
+
+shared_table <- shared_table %>%
+  arrange(min_p)
+
+############################################################
+## 9. export
+############################################################
+colnames(shared_table)
+fwrite(shared_table, "Shared_nonpCR_up_genes.csv")
+
