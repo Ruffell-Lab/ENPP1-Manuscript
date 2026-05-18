@@ -17,7 +17,6 @@ setwd("~/Desktop/ISPY2 updated")
 ############################################################
 
 vc <- fread("VC_limma_results_nonpCR_vs_pCR.csv")
-pembro <- fread("Pembro_limma_results_nonpCR_vs_pCR.csv")
 durva <- fread("Durvalumab_Olaparib_limma_results_nonpCR_vs_pCR.csv")
 
 ############################################################
@@ -25,19 +24,13 @@ durva <- fread("Durvalumab_Olaparib_limma_results_nonpCR_vs_pCR.csv")
 ############################################################
 
 colnames(vc)
-colnames(pembro)
 colnames(durva)
-
 
 ############################################################
 ## 3. Selection：non-pCR upregulation with stastical significant
 ############################################################
 
 vc_up <- vc %>%
-  filter(logFC > 0, P.Value < 0.05) %>%
-  pull(gene)
-
-pembro_up <- pembro %>%
   filter(logFC > 0, P.Value < 0.05) %>%
   pull(gene)
 
@@ -51,7 +44,6 @@ durva_up <- durva %>%
 
 gene_list <- list(
   VC = vc_up,
-  Pembro = pembro_up,
   Durva_Olaparib = durva_up
 )
 
@@ -83,17 +75,6 @@ vc_sub <- vc %>%
   )
 
 ############################################################
-## Pembro
-############################################################
-pembro_sub <- pembro %>%
-  filter(.data[["gene"]] %in% shared_genes) %>%
-  select(
-    gene = .data[["gene"]],
-    Pembro_logFC = .data[["logFC"]],
-    Pembro_P = .data[["P.Value"]]
-  )
-
-############################################################
 ## Durva
 ############################################################
 durva_sub <- durva %>%
@@ -113,18 +94,7 @@ shared_table <- vc_sub %>%
   left_join(durva_sub, by = "gene")
 
 ############################################################
-## 8. Add max_logFC and min_P
-############################################################
-
-shared_table <- shared_table %>%
-  mutate(max_logFC = pmax(VC_logFC, Pembro_logFC, Durva_logFC),
-         min_p = pmin(VC_P, Pembro_P, Durva_P))
-
-shared_table <- shared_table %>%
-  arrange(min_p)
-
-############################################################
-## 9. export
+## 8. export
 ############################################################
 colnames(shared_table)
 fwrite(shared_table, "Shared_nonpCR_up_genes.csv")
