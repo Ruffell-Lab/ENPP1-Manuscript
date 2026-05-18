@@ -171,8 +171,7 @@ fwrite(
 
 #####Differential Genes from non PCR vs PCR in GSE194040######
 ############################################################
-## ISPY2 – VC and Pembrolizumab volcano plots
-## Clean run from restarted R session
+## ISPY2 – VC volcano plot
 ############################################################
 
 rm(list = ls())
@@ -308,106 +307,27 @@ res_vc <- run_volcano(
   group_name = "VC arm",
   prefix = "VC"
 )
-
 ############################################################
-## 4. Pembrolizumab arm
-############################################################
-
-df_pembro <- df[
-  grepl("pembro|pembrolizumab", arm, ignore.case = TRUE) |
-    grepl("pembro|pembrolizumab", `arm (short name)`, ignore.case = TRUE)
-]
-
-res_pembro <- run_volcano(
-  df_sub = df_pembro,
-  group_name = "Pembrolizumab arm",
-  prefix = "Pembro"
-)
-
-############################################################
-## 5. Paclitaxel control arm
-############################################################
-
-df_ctr <- df[
-  `arm (short name)` == "Ctr" |
-    arm == "Paclitaxel" |
-    grepl("^Paclitaxel$", arm, ignore.case = TRUE)
-]
-
-res_ctr <- run_volcano(
-  df_sub = df_ctr,
-  group_name = "Paclitaxel control arm",
-  prefix = "Ctr"
-)
-############################################################
-## 6. ENPP1 comparison
+## 4. ENPP1 comparison
 ############################################################
 
 cat("\n==== ENPP1 comparison ====\n")
 
 print(res_vc[res_vc$gene == "ENPP1", ])
-print(res_pembro[res_pembro$gene == "ENPP1", ])
-print(res_ctr[res_ctr$gene == "ENPP1", ])
-
 enpp1_summary <- rbind(
   cbind(Arm = "VC", res_vc[res_vc$gene == "ENPP1", ]),
-  cbind(Arm = "Pembro", res_pembro[res_pembro$gene == "ENPP1", ]),
-  cbind(Arm = "Ctr", res_ctr[res_ctr$gene == "ENPP1", ])
 )
 
 write.csv(
   enpp1_summary,
-  "ENPP1_VC_Pembro_Ctr_volcano_summary.csv",
-  row.names = FALSE
-)
-############################################################
-## 6. Save ENPP1 summary table
-############################################################
-############################################################
-## 6. Treatment-specific resistance overlap
-############################################################
-
-VC_up <- res_vc %>%
-  filter(logFC > 0.5 & P.Value < 0.05) %>%
-  pull(gene)
-
-Pembro_up <- res_pembro %>%
-  filter(logFC > 0.5 & P.Value < 0.05) %>%
-  pull(gene)
-
-Ctr_up <- res_ctr %>%
-  filter(logFC > 0.5 & P.Value < 0.05) %>%
-  pull(gene)
-
-VC_specific <- setdiff(VC_up, Ctr_up)
-Pembro_specific <- setdiff(Pembro_up, Ctr_up)
-
-final_shared <- intersect(VC_specific, Pembro_specific)
-
-cat("VC_up:", length(VC_up), "\n")
-cat("Pembro_up:", length(Pembro_up), "\n")
-cat("Ctr_up:", length(Ctr_up), "\n")
-cat("VC_specific:", length(VC_specific), "\n")
-cat("Pembro_specific:", length(Pembro_specific), "\n")
-cat("Final_shared:", length(final_shared), "\n")
-cat("ENPP1 in final_shared:", "ENPP1" %in% final_shared, "\n")
-
-enpp1_summary <- rbind(
-  cbind(Arm = "VC", res_vc[res_vc$gene == "ENPP1", ]),
-  cbind(Arm = "Pembro", res_pembro[res_pembro$gene == "ENPP1", ]),
-  cbind(Arm = "Ctr", res_ctr[res_ctr$gene == "ENPP1", ])
-)
-
-write.csv(
-  enpp1_summary,
-  "ENPP1_VC_Pembro_Ctr_volcano_summary.csv",
+  "ENPP1_VC_volcano_summary.csv",
   row.names = FALSE
 )
 
 #####Differential Genes from non PCR vs PCR in GSE173839######
 ############################################################
 ## GSE173839 – durva + olaparib arm
-## non-pCR vs pCR (same as pembro / VC)
+## non-pCR vs pCR (same as VC)
 ############################################################
 
 library(data.table)
