@@ -1,0 +1,578 @@
+############################################################
+## VC + DO immune genes + ENPP1 / IL20 / SIGLEC15/SIGIRR correlation
+## Updated:
+## 1. VC + DO in same heatmap for each target gene
+## 2. All targets together in one combined heatmap
+############################################################
+
+library(data.table)
+library(readxl)
+library(dplyr)
+library(openxlsx)
+library(pheatmap)
+
+############################################################
+## 0. Genes of interest
+############################################################
+
+target_genes <- c("ENPP1", "IL20", "SIGLEC15","SIGIRR")
+
+immune_genes <- c(
+  "CD4", "CD8B", "ISG15", "CXCL9",
+  "CXCL10", "GZMB", "IFNG"
+)
+
+genes_keep <- unique(c(immune_genes, target_genes))
+
+############################################################
+## 1. Function: read GEO series matrix metadata
+############################################################
+
+read_geo_series_metadata2 <- function(file) {
+  
+  lines <- readLines(file)
+  
+  sample_lines <- grep("^!Sample_", lines, value = TRUE)
+  sample_lines <- sample_lines[!grepl("^!Sample_table", sample_lines)]
+  
+  split_lines <- strsplit(sample_lines, "\t")
+  
+  keys <- sapply(split_lines, function(x) {
+    gsub("^!Sample_", "", x[1])
+  })
+  
+  values <- lapply(split_lines, function(x) {
+    gsub('"', "", x[-1])
+  })
+  
+  keys_unique <- make.unique(keys)
+  
+  meta <- as.data.frame(
+    do.call(rbind, values),
+    stringsAsFactors = FALSE
+  )
+  
+  rownames(meta) <- keys_unique
+  meta <- as.data.frame(t(meta), stringsAsFactors = FALSE)
+  colnames(meta) <- keys_unique
+  
+  meta
+}
+
+############################################################
+## 2. Read OLD I-SPY2 expression matrix
+############################################################
+
+message("Select: ISPY2_GSE196096_annotation_ALL_gene_expression_matched_only.csv")
+old_expr <- fread(file.choose())
+colnames(old_expr) <- trimws(colnames(old_expr))
+
+############################################################
+## 3. Read OLD I-SPY2 patient metadata
+############################################################
+
+message("Select: ENPP1_ISPY2_PatientMetaInformation_20230628.xlsx")
+old_meta <- read_excel(file.choose()) %>% as.data.frame()
+colnames(old_meta) <- trimws(colnames(old_meta))
+
+if (nrow(old_meta) != nrow(old_expr)) {
+  stop("old_meta and old_expr have different row numbers. Do not cbind.")
+}
+
+############################################################
+## 4. Combine OLD metadata + selected genes
+############################################################
+
+missing_old_genes <- setdiff(genes_keep, colnames(old_expr))
+
+if (length(missing_old_genes) > 0) {
+  warning("Missing genes in old_expr: ", paste(missing_old_genes, collapse = ", "))
+}
+
+genes_old <- intersect(genes_keep, colnames(old_expr))
+
+old_combined <- cbind(
+  old_meta,
+  old_expr[, genes_old, with = FALSE]
+)
+
+############################################################
+## 5. Extract TRUE VC arm
+############################################################
+
+cat("\nOLD I-SPY2 arm summary:\n")
+print(table(old_combined$`Arm (short name)`, useNA = "ifany"))
+print(table(old_combined$Arm, useNA = "ifany"))
+
+vc_final <- old_combined %>%
+  filter(trimws(`Arm (short name)`) == "VC") %>%
+  mutate(
+    cohort = "ISPY2_old_arms",
+    analysis_arm = "VC",
+    original_arm = Arm,
+    .before = 1
+  )
+
+cat("\nVC check:\n")
+print(dim(vc_final))
+print(table(vc_final$`Arm (short name)`, useNA = "ifany"))
+print(table(vc_final$pCR, useNA = "ifany"))
+
+############################################################
+## 6. Read DO expression matrix
+############################################################
+
+message("Select: GSE173839_ISPY2_AgilentGeneExp_durvaPlusCtr_FFPE_meanCol_geneLevel_n105.txt")
+expr_do <- fread(file.choose())
+
+colnames(expr_do)[1] <- "gene"
+
+expr_mat <- as.data.frame(expr_do)
+rownames(expr_mat) <- expr_mat$gene
+expr_mat <- expr_mat[, -1]
+
+expr_mat <- as.matrix(expr_mat)
+mode(expr_mat) <- "numeric"
+
+if (max(expr_mat, na.rm = TRUE) > 50) {
+  expr_mat <- log2(expr_mat + 1)
+}
+
+cat("\nDO expression matrix:\n")
+print(dim(expr_mat))
+
+############################################################
+## 7. Read DO metadata from GEO series matrix
+############################################################
+
+message("Select: GSE173839_series_matrix.txt")
+geo_meta <- read_geo_series_metadata2(file.choose())
+
+char_cols <- grep("characteristics", colnames(geo_meta), value = TRUE)
+print(char_cols)
+print(head(geo_meta[, char_cols], 10))
+
+############################################################
+## 8. Parse DO metadata
+############################################################
+
+do_meta_geo <- geo_meta %>%
+  mutate(
+    HER2 = as.numeric(sub("her2: ", "", characteristics_ch1.1)),
+    HR   = as.numeric(sub("hr: ", "", characteristics_ch1.2)),
+    pCR  = as.numeric(sub("pcr: ", "", characteristics_ch1.3)),
+    MP2  = as.numeric(sub("mp: ", "", characteristics_ch1.4)),
+    Arm  = sub("arm: ", "", characteristics_ch1.5),
+    `Arm (short name)` = ifelse(Arm == "durvalumab/olaparib", "DO", "Control"),
+    `Patient Identifier` = geo_accession,
+    `HER2: the status of the HER2 gene` = paste0("her2: ", HER2),
+    `HR: the status of hormone (estrogen and progesterone) receptors` = paste0("hr: ", HR),
+    `MammaPrint status` = paste0("mp: ", MP2),
+    `pCR: the status of a pathological complete response (pCR)` = paste0("pcr: ", pCR),
+    `Arm: arm of the trial per patient:` = paste0("arm: ", Arm)
+  )
+
+cat("\nDO metadata check:\n")
+print(table(do_meta_geo$Arm, useNA = "ifany"))
+print(table(do_meta_geo$`Arm (short name)`, useNA = "ifany"))
+print(table(do_meta_geo$pCR, useNA = "ifany"))
+
+############################################################
+## 9. Match DO expression and GEO metadata by order
+############################################################
+
+if (ncol(expr_mat) != nrow(do_meta_geo)) {
+  stop("DO expression columns and GEO metadata rows are not equal. Check sample order.")
+}
+
+do_meta_geo$SampleID_expr <- colnames(expr_mat)
+
+############################################################
+## 10. Extract DO arm
+############################################################
+
+do_idx <- do_meta_geo$Arm == "durvalumab/olaparib"
+
+clin_dop <- do_meta_geo[do_idx, , drop = FALSE]
+expr_dop <- expr_mat[, do_idx, drop = FALSE]
+
+expr_dop_t <- as.data.frame(t(expr_dop))
+expr_dop_t$SampleID_expr <- rownames(expr_dop_t)
+
+missing_do_genes <- setdiff(genes_keep, colnames(expr_dop_t))
+
+if (length(missing_do_genes) > 0) {
+  warning("Missing genes in DO matrix: ", paste(missing_do_genes, collapse = ", "))
+}
+
+genes_do <- intersect(genes_keep, colnames(expr_dop_t))
+
+############################################################
+## 11. Make DO final table
+############################################################
+
+do_final <- cbind(
+  clin_dop,
+  expr_dop_t[, genes_do, drop = FALSE]
+) %>%
+  as.data.frame() %>%
+  mutate(
+    cohort = "GSE173839",
+    analysis_arm = "DO",
+    original_arm = "Durvalumab + Olaparib",
+    ENPP1_Expression = ifelse("ENPP1" %in% colnames(.), ENPP1, NA),
+    .before = 1
+  )
+
+cat("\nDO final check:\n")
+print(dim(do_final))
+print(table(do_final$`Arm (short name)`, useNA = "ifany"))
+print(table(do_final$pCR, useNA = "ifany"))
+
+############################################################
+## 12. Output folder
+############################################################
+
+out_dir <- "~/Desktop/Immune genes in two arm"
+
+if (!dir.exists(out_dir)) {
+  dir.create(out_dir, recursive = TRUE)
+}
+
+cor_out_dir <- file.path(out_dir, "Correlation_heatmaps_combined")
+
+if (!dir.exists(cor_out_dir)) {
+  dir.create(cor_out_dir, recursive = TRUE)
+}
+
+############################################################
+## 13. Export source Excel
+############################################################
+
+out_file <- file.path(
+  out_dir,
+  "VC_DO_immune_genes_ENPP1_IL20_SIGLEC15_FINAL_metadata.xlsx"
+)
+
+wb <- createWorkbook()
+
+addWorksheet(wb, "VC_with_metadata")
+writeData(wb, "VC_with_metadata", vc_final)
+
+addWorksheet(wb, "DO_with_GEO_metadata")
+writeData(wb, "DO_with_GEO_metadata", do_final)
+
+addWorksheet(wb, "Genes_used")
+writeData(wb, "Genes_used", data.frame(Gene = genes_keep))
+
+saveWorkbook(wb, out_file, overwrite = TRUE)
+
+message("Source Excel exported to:")
+message(out_file)
+
+############################################################
+## 14. Function: calculate correlation for one target in one arm
+############################################################
+
+calculate_target_cor <- function(df, arm_name, target_gene, immune_genes) {
+  
+  if (!(target_gene %in% colnames(df))) {
+    warning(paste0(target_gene, " not found in ", arm_name))
+    return(NULL)
+  }
+  
+  immune_available <- intersect(immune_genes, colnames(df))
+  
+  cor_values <- data.frame(
+    Target_gene = target_gene,
+    Arm = arm_name,
+    Gene = immune_available,
+    Spearman_rho = NA_real_,
+    P_value = NA_real_,
+    N = NA_integer_,
+    stringsAsFactors = FALSE
+  )
+  
+  for (g in immune_available) {
+    
+    tmp <- df[, c(target_gene, g)]
+    tmp[[target_gene]] <- as.numeric(tmp[[target_gene]])
+    tmp[[g]] <- as.numeric(tmp[[g]])
+    tmp <- tmp[complete.cases(tmp), ]
+    
+    cor_values[cor_values$Gene == g, "N"] <- nrow(tmp)
+    
+    if (nrow(tmp) >= 5) {
+      ct <- suppressWarnings(
+        cor.test(
+          tmp[[target_gene]],
+          tmp[[g]],
+          method = "spearman",
+          exact = FALSE
+        )
+      )
+      
+      cor_values[cor_values$Gene == g, "Spearman_rho"] <- as.numeric(ct$estimate)
+      cor_values[cor_values$Gene == g, "P_value"] <- ct$p.value
+    }
+  }
+  
+  cor_values$Significance <- cut(
+    cor_values$P_value,
+    breaks = c(-Inf, 0.001, 0.01, 0.05, Inf),
+    labels = c("***", "**", "*", ""),
+    right = TRUE
+  )
+  
+  cor_values$Significance <- as.character(cor_values$Significance)
+  cor_values$Significance[is.na(cor_values$Significance)] <- ""
+  
+  cor_values
+}
+
+############################################################
+## 15. Calculate all correlations
+############################################################
+
+all_cor_results <- list()
+
+for (tg in target_genes) {
+  
+  all_cor_results[[paste0(tg, "_VC")]] <- calculate_target_cor(
+    df = vc_final,
+    arm_name = "VC",
+    target_gene = tg,
+    immune_genes = immune_genes
+  )
+  
+  all_cor_results[[paste0(tg, "_DO")]] <- calculate_target_cor(
+    df = do_final,
+    arm_name = "DO",
+    target_gene = tg,
+    immune_genes = immune_genes
+  )
+}
+
+cor_table <- bind_rows(all_cor_results)
+
+cor_excel <- file.path(
+  cor_out_dir,
+  "VC_DO_ENPP1_IL20_SIGLEC15_immune_gene_correlations.xlsx"
+)
+
+write.xlsx(cor_table, cor_excel, overwrite = TRUE)
+
+############################################################
+## 16. Function: make VC + DO heatmap for each target gene
+############################################################
+
+make_one_target_two_arm_heatmap <- function(cor_table, target_gene, immune_genes, out_dir) {
+  
+  sub_cor <- cor_table %>%
+    filter(Target_gene == target_gene)
+  
+  row_order <- c("VC", "DO")
+  
+  mat <- matrix(
+    NA_real_,
+    nrow = length(row_order),
+    ncol = length(immune_genes)
+  )
+  
+  rownames(mat) <- row_order
+  colnames(mat) <- immune_genes
+  
+  display_mat <- matrix(
+    "",
+    nrow = length(row_order),
+    ncol = length(immune_genes)
+  )
+  
+  rownames(display_mat) <- row_order
+  colnames(display_mat) <- immune_genes
+  
+  for (arm in row_order) {
+    for (g in immune_genes) {
+      
+      tmp <- sub_cor %>%
+        filter(Arm == arm, Gene == g)
+      
+      if (nrow(tmp) == 1) {
+        mat[arm, g] <- tmp$Spearman_rho
+        
+        display_mat[arm, g] <- paste0(
+          sprintf("%.2f", tmp$Spearman_rho),
+          tmp$Significance
+        )
+      }
+    }
+  }
+  
+  pdf_file <- file.path(
+    out_dir,
+    paste0(target_gene, "_VC_DO_immune_gene_correlation_heatmap.pdf")
+  )
+  
+  pdf(pdf_file, width = 8.5, height = 3.2)
+  
+  pheatmap(
+    mat,
+    color = colorRampPalette(c("#00BFC4", "white", "#F8766D"))(100),
+    breaks = seq(-1, 1, length.out = 101),
+    cluster_rows = FALSE,
+    cluster_cols = FALSE,
+    display_numbers = display_mat,
+    number_color = "black",
+    fontsize_number = 10,
+    fontsize_row = 11,
+    fontsize_col = 10,
+    main = paste0(target_gene, ": correlation with immune genes"),
+    border_color = "grey80"
+  )
+  
+  dev.off()
+}
+
+############################################################
+## 17. Make three separate heatmaps
+##     Each heatmap: VC + DO
+############################################################
+
+for (tg in target_genes) {
+  make_one_target_two_arm_heatmap(
+    cor_table = cor_table,
+    target_gene = tg,
+    immune_genes = immune_genes,
+    out_dir = cor_out_dir
+  )
+}
+
+############################################################
+## 18. Make one combined heatmap
+##     Order:
+##     IL20_VC, IL20_DO,
+##     SIGIRR_VC, SIGIRR_DO,
+##     SIGLEC15_VC, SIGLEC15_DO,
+##     ENPP1_VC, ENPP1_DO
+############################################################
+
+combined_order <- data.frame(
+  Target_gene = c(
+    "IL20", "IL20",
+    "SIGIRR", "SIGIRR",
+    "SIGLEC15", "SIGLEC15",
+    "ENPP1", "ENPP1"
+  ),
+  Arm = c(
+    "VC", "DO",
+    "VC", "DO",
+    "VC", "DO",
+    "VC", "DO"
+  ),
+  Row_name = c(
+    "IL20_VC", "IL20_DO",
+    "SIGIRR_VC", "SIGIRR_DO",
+    "SIGLEC15_VC", "SIGLEC15_DO",
+    "ENPP1_VC", "ENPP1_DO"
+  ),
+  stringsAsFactors = FALSE
+)
+
+combined_mat <- matrix(
+  NA_real_,
+  nrow = nrow(combined_order),
+  ncol = length(immune_genes)
+)
+
+rownames(combined_mat) <- combined_order$Row_name
+colnames(combined_mat) <- immune_genes
+
+combined_display <- matrix(
+  "",
+  nrow = nrow(combined_order),
+  ncol = length(immune_genes)
+)
+
+rownames(combined_display) <- combined_order$Row_name
+colnames(combined_display) <- immune_genes
+
+for (i in seq_len(nrow(combined_order))) {
+  
+  tg  <- combined_order$Target_gene[i]
+  arm <- combined_order$Arm[i]
+  rn  <- combined_order$Row_name[i]
+  
+  for (g in immune_genes) {
+    
+    tmp <- cor_table %>%
+      filter(
+        Target_gene == tg,
+        Arm == arm,
+        Gene == g
+      )
+    
+    if (nrow(tmp) == 1) {
+      combined_mat[rn, g] <- tmp$Spearman_rho
+      
+      combined_display[rn, g] <- paste0(
+        sprintf("%.2f", tmp$Spearman_rho),
+        tmp$Significance
+      )
+    }
+  }
+}
+
+combined_pdf <- file.path(
+  cor_out_dir,
+  "ALL_TARGETS_VC_DO_immune_gene_correlation_heatmap_with_SIGIRR.pdf"
+)
+
+pdf(combined_pdf, width = 9.5, height = 6.2)
+
+pheatmap(
+  combined_mat,
+  color = colorRampPalette(c("#00BFC4", "white", "#F8766D"))(100),
+  breaks = seq(-1, 1, length.out = 101),
+  cluster_rows = FALSE,
+  cluster_cols = FALSE,
+  display_numbers = combined_display,
+  number_color = "black",
+  fontsize_number = 8.5,
+  fontsize_row = 10,
+  fontsize_col = 10,
+  main = "Correlation of IL20 / SIGIRR / SIGLEC15 / ENPP1 with immune genes",
+  border_color = "grey80"
+)
+
+dev.off()
+############################################################
+## 19. Final message
+############################################################
+
+cat("\nFinal VC dimensions:\n")
+print(dim(vc_final))
+
+cat("\nFinal DO dimensions:\n")
+print(dim(do_final))
+
+cat("\nGenes found in VC:\n")
+print(intersect(genes_keep, colnames(vc_final)))
+
+cat("\nGenes found in DO:\n")
+print(intersect(genes_keep, colnames(do_final)))
+
+cat("\nCorrelation table preview:\n")
+print(head(cor_table, 20))
+
+message("Done.")
+message("Source Excel exported to:")
+message(out_file)
+
+message("Correlation Excel exported to:")
+message(cor_excel)
+
+message("Correlation heatmaps exported to:")
+message(cor_out_dir)
+
+message("Combined heatmap:")
+message(combined_pdf)
