@@ -1,0 +1,191 @@
+############################################################
+## Cross-arm shared genes: VC vs Durvalumab/Olaparib
+## non-pCR vs pCR
+## Color = significance; size = Stouffer score
+############################################################
+
+rm(list = ls())
+
+library(dplyr)
+library(ggplot2)
+library(ggrepel)
+library(openxlsx)
+
+############################################################
+## 1. Choose working folder by popup
+############################################################
+
+if (!requireNamespace("rstudioapi", quietly = TRUE)) {
+  install.packages("rstudioapi")
+}
+library(rstudioapi)
+
+work_dir <- rstudioapi::selectDirectory(
+  caption = "please choose the folder containing two CSV files"
+)
+
+if (is.null(work_dir)) {
+  stop("No folder selected.")
+}
+
+setwd(work_dir)
+
+cat("Current working directory:\n", getwd(), "\n")
+
+vc <- read.csv("VC_limma_results_nonpCR_vs_pCR.csv", check.names = FALSE)
+durva <- read.csv("Durvalumab_Olaparib_limma_results_nonpCR_vs_pCR.csv", check.names = FALSE)
+############################################################
+## 3. Standardize columns
+############################################################
+
+vc2 <- vc %>%
+  transmute(
+    Gene = as.character(gene),
+    logFC_VC = as.numeric(logFC),
+    P_VC = as.numeric(P.Value)
+  )
+
+durva2 <- durva %>%
+  transmute(
+    Gene = as.character(gene),
+    logFC_DurvaOla = as.numeric(logFC),
+    P_DurvaOla = as.numeric(P.Value)
+  )
+
+df <- inner_join(vc2, durva2, by = "Gene") %>%
+  filter(
+    !is.na(logFC_VC),
+    !is.na(logFC_DurvaOla),
+    !is.na(P_VC),
+    !is.na(P_DurvaOla),
+    P_VC > 0,
+    P_DurvaOla > 0
+  )
+
+############################################################
+## 4. Stouffer combined P
+############################################################
+
+df <- df %>%
+  mutate(
+    z_VC = qnorm(1 - P_VC / 2) * sign(logFC_VC),
+    z_DurvaOla = qnorm(1 - P_DurvaOla / 2) * sign(logFC_DurvaOla),
+    
+    stouffer_z = (z_VC + z_DurvaOla) / sqrt(2),
+    stouffer_p = 2 * pnorm(-abs(stouffer_z)),
+    stouffer_score = -log10(stouffer_p)
+  )
+
+############################################################
+## 5. Direction + significance
+############################################################
+
+df <- df %>%
+  mutate(
+    Direction = case_when(
+      logFC_VC > 0 & logFC_DurvaOla > 0 ~ "NR-up",
+      logFC_VC < 0 & logFC_DurvaOla < 0 ~ "R-up",
+      TRUE ~ "Discordant"
+    ),
+    
+    SigGroup = case_when(
+      Direction == "NR-up" & stouffer_p < 0.05 ~ "NR-up significant",
+      Direction == "R-up" & stouffer_p < 0.05 ~ "R-up significant",
+      Direction %in% c("NR-up", "R-up") ~ "Direction only",
+      TRUE ~ "Other"
+    )
+  )
+
+############################################################
+## 6. Label top 20 NR-up significant 
+############################################################
+
+top20_NR <- df %>%
+  filter(Direction == "NR-up", stouffer_p < 0.05) %>%
+  arrange(stouffer_p) %>%
+  slice_head(n = 20) %>%
+  pull(Gene)
+
+label_genes <- unique(c("ENPP1", top20_NR))
+
+df <- df %>%
+  mutate(
+    Label = ifelse(Gene %in% label_genes, Gene, NA),
+    SigGroup = factor(
+      SigGroup,
+      levels = c("NR-up significant", "R-up significant", "Direction only", "Other")
+    )
+  )
+
+############################################################
+## 7. Plot
+############################################################
+
+p <- ggplot(df, aes(x = logFC_VC, y = logFC_DurvaOla)) +
+  
+  geom_point(
+    aes(size = stouffer_score, color = SigGroup),
+    alpha = 0.55
+  ) +
+  
+  geom_vline(xintercept = 0, linetype = "dashed", linewidth = 0.4) +
+  geom_hline(yintercept = 0, linetype = "dashed", linewidth = 0.4) +
+  
+  geom_text_repel(
+    aes(label = Label),
+    size = 3.4,
+    color = "black",
+    max.overlaps = Inf,
+    box.padding = 0.35,
+    point.padding = 0.25,
+    segment.size = 0.25,
+    min.segment.length = 0
+  ) +
+  
+  scale_color_manual(
+    values = c(
+      "NR-up significant" = "#F8766D",
+      "R-up significant" = "#00BFC4",
+      "Direction only" = "grey75",
+      "Other" = "grey75"
+    )
+  ) +
+  
+  scale_size_continuous(
+    name = "-log10(Stouffer P)",
+    range = c(0.5, 4.2)
+  ) +
+  
+  labs(
+    title = "Cross-arm consistency: non-pCR vs pCR",
+    subtitle = "VC vs Durvalumab/Olaparib; color = significance; size = combined evidence",
+    x = "VC logFC (non-pCR vs pCR)",
+    y = "Durvalumab/Olaparib logFC (non-pCR vs pCR)",
+    color = ""
+  ) +
+  
+  theme_classic(base_size = 14) +
+  theme(
+    plot.title = element_text(face = "bold"),
+    legend.position = "right"
+  )
+
+print(p)
+
+############################################################
+## 8. Export
+############################################################
+
+pdf("CrossArm_VC_vs_DurvaOla_Stouffer.pdf",
+    width = 9, height = 6)
+print(p)
+dev.off()
+
+write.xlsx(
+  df,
+  file = "CrossArm_VC_vs_DurvaOla_Stouffer_results.xlsx",
+  overwrite = TRUE
+)
+
+cat("\labeled NR-up significant genes:\n")
+print(NR)
