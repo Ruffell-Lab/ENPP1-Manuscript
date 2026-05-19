@@ -1,0 +1,580 @@
+############################################################
+# CPTAC BRCA
+# ENPP1 protein vs immune score / CIN / ER-HER2-TNBC
+############################################################
+
+rm(list = ls())
+
+suppressPackageStartupMessages({
+  library(data.table)
+  library(dplyr)
+  library(tidyr)
+  library(ggplot2)
+  library(ggpubr)
+})
+
+############################################################
+# 0) set working directory
+############################################################
+
+setwd("~/Desktop/brca_cptac_2020")
+
+outdir <- "ENPP1_feature_association_no_stromal_no_stemness"
+dir.create(outdir, showWarnings = FALSE)
+
+############################################################
+# 1) helper functions
+############################################################
+
+read_cbio_clinical <- function(file) {
+  x <- readLines(file)
+  header_idx <- which(grepl("^(PATIENT_ID|SAMPLE_ID)\t", x))[1]
+  if (is.na(header_idx)) stop(paste("Cannot find header row in", file))
+  fread(file, skip = header_idx - 1, sep = "\t", header = TRUE)
+}
+
+standardize_subtype <- function(x) {
+  y <- toupper(trimws(as.character(x)))
+  y[y %in% c("", "NA", "N/A", "NULL")] <- NA
+  
+  out <- rep(NA_character_, length(y))
+  out[grepl("LUMINAL A|LUMA", y)] <- "Luminal A"
+  out[grepl("LUMINAL B|LUMB", y)] <- "Luminal B"
+  out[grepl("HER2", y)] <- "HER2-enriched"
+  out[grepl("BASAL|BASAL-LIKE|TNBC|TRIPLE", y)] <- "Basal/TNBC"
+  out[grepl("NORMAL", y)] <- "Normal-like"
+  out
+}
+
+clean_binary_status <- function(x) {
+  y <- trimws(as.character(x))
+  y[y %in% c("", "NA", "N/A", "NULL", "<NA>")] <- NA
+  
+  y2 <- toupper(y)
+  out <- rep(NA_character_, length(y2))
+  
+  out[y2 %in% c("POSITIVE", "POS", "AMPLIFIED", "YES")] <- "Positive"
+  out[y2 %in% c("NEGATIVE", "NEG", "NO")] <- "Negative"
+  
+  out[grepl("POSITIVE|AMPLIFIED", y2)] <- "Positive"
+  out[grepl("NEGATIVE", y2)] <- "Negative"
+  
+  out
+}
+
+############################################################
+# 2) read data
+############################################################
+
+prot <- fread("data_protein_quantification.txt")
+clin_pat <- read_cbio_clinical("data_clinical_patient.txt")
+clin_sam <- read_cbio_clinical("data_clinical_sample.txt")
+
+cat("===== patient columns =====\n")
+print(colnames(clin_pat))
+
+cat("===== sample columns =====\n")
+print(colnames(clin_sam))
+
+############################################################
+# 3) extract ENPP1 protein
+############################################################
+
+enpp1 <- prot %>%
+  filter(grepl("^ENPP1\\|", .data[[colnames(prot)[1]]])) %>%
+  pivot_longer(
+    cols = -1,
+    names_to = "SampleID",
+    values_to = "ENPP1_protein"
+  ) %>%
+  select(SampleID, ENPP1_protein)
+
+cat("===== ENPP1 summary =====\n")
+print(summary(enpp1$ENPP1_protein))
+
+############################################################
+# 4) build clinical tables
+############################################################
+
+clin_pat2 <- clin_pat %>%
+  transmute(
+    PatientID = PATIENT_ID,
+    ER_status_raw = ER_UPDATED_CLINICAL_STATUS,
+    PR_status_raw = PR_CLINICAL_STATUS,
+    HER2_status_raw = ERBB2_UPDATED_CLINICAL_STATUS,
+    TNBC_status_raw = TNBC_UPDATED_CLINICAL_STATUS,
+    CIN = CHROMOSOME_INSTABILITY_INDEX_CIN_,
+    ESTIMATE_Immune = ESTIMATE_IMMUNE_SCORE,
+    XCELL_Immune = XCELL_IMMUNE_SCORE
+  ) %>%
+  mutate(
+    ER_status = clean_binary_status(ER_status_raw),
+    PR_status = clean_binary_status(PR_status_raw),
+    HER2_status = clean_binary_status(HER2_status_raw),
+    TNBC_status = clean_binary_status(TNBC_status_raw)
+  )
+
+clin_sam2 <- clin_sam %>%
+  transmute(
+    SampleID = SAMPLE_ID,
+    PatientID = PATIENT_ID,
+    PAM50_raw = PAM50,
+    Subtype = standardize_subtype(PAM50)
+  )
+
+############################################################
+# 5) merge
+############################################################
+
+dat <- enpp1 %>%
+  left_join(clin_sam2, by = "SampleID") %>%
+  left_join(clin_pat2, by = "PatientID")
+
+cat("===== merged overview =====\n")
+cat("n total:", nrow(dat), "\n")
+print(table(dat$Subtype, useNA = "ifany"))
+
+fwrite(
+  dat,
+  file.path(outdir, "ENPP1_feature_merged_table_no_stromal_no_stemness.tsv"),
+  sep = "\t"
+)
+
+############################################################
+# 6) helper: scatter plot + correlation
+############################################################
+
+plot_corr_feature <- function(df, feature_col, feature_label, filename_prefix) {
+  
+  df2 <- df %>%
+    filter(!is.na(ENPP1_protein), !is.na(.data[[feature_col]]))
+  
+  if (nrow(df2) < 8) {
+    cat("Skip", feature_col, "- too few samples\n")
+    return(NULL)
+  }
+  
+  ct <- cor.test(
+    df2$ENPP1_protein,
+    df2[[feature_col]],
+    method = "spearman"
+  )
+  
+  res <- data.frame(
+    Feature = feature_col,
+    N = nrow(df2),
+    Spearman_rho = unname(ct$estimate),
+    P_value = ct$p.value
+  )
+  
+  p <- ggplot(
+    df2,
+    aes(x = ENPP1_protein, y = .data[[feature_col]])
+  ) +
+    geom_point(alpha = 0.75, size = 2) +
+    geom_smooth(method = "lm", se = FALSE) +
+    theme_classic(base_size = 13) +
+    labs(
+      title = paste0(
+        "ENPP1 vs ", feature_label,
+        " (rho = ", round(ct$estimate, 3),
+        ", p = ", signif(ct$p.value, 3), ")"
+      ),
+      x = "Normalized ENPP1 protein expression",
+      y = feature_label
+    )
+  
+  ggsave(
+    file.path(outdir, paste0(filename_prefix, ".pdf")),
+    p,
+    width = 6,
+    height = 5
+  )
+  
+  fwrite(
+    res,
+    file.path(outdir, paste0(filename_prefix, "_correlation.tsv")),
+    sep = "\t"
+  )
+  
+  return(res)
+}
+
+############################################################
+# 7) helper: box/violin by binary status
+############################################################
+
+plot_binary_group <- function(df, group_col, group_label, filename_prefix) {
+  
+  df2 <- df %>%
+    filter(!is.na(ENPP1_protein), !is.na(.data[[group_col]]))
+  
+  if (nrow(df2) < 8) {
+    cat("Skip", group_col, "- too few samples\n")
+    return(NULL)
+  }
+  
+  if (length(unique(df2[[group_col]])) < 2) {
+    cat("Skip", group_col, "- only one level\n")
+    return(NULL)
+  }
+  
+  stats_df <- df2 %>%
+    group_by(.data[[group_col]]) %>%
+    summarise(
+      n = n(),
+      median_ENPP1 = median(ENPP1_protein, na.rm = TRUE),
+      mean_ENPP1 = mean(ENPP1_protein, na.rm = TRUE),
+      .groups = "drop"
+    )
+  
+  fwrite(
+    stats_df,
+    file.path(outdir, paste0(filename_prefix, "_summary.tsv")),
+    sep = "\t"
+  )
+  
+  p <- ggplot(
+    df2,
+    aes(
+      x = .data[[group_col]],
+      y = ENPP1_protein,
+      fill = .data[[group_col]]
+    )
+  ) +
+    geom_violin(trim = FALSE, alpha = 0.5) +
+    geom_boxplot(width = 0.18, outlier.shape = NA, alpha = 0.8) +
+    geom_jitter(width = 0.10, size = 1.5, alpha = 0.7) +
+    stat_compare_means(method = "wilcox.test") +
+    theme_classic(base_size = 13) +
+    labs(
+      title = paste0("ENPP1 protein by ", group_label),
+      x = "",
+      y = "Normalized ENPP1 protein expression"
+    ) +
+    theme(legend.position = "none")
+  
+  ggsave(
+    file.path(outdir, paste0(filename_prefix, ".pdf")),
+    p,
+    width = 5,
+    height = 5
+  )
+  
+  return(stats_df)
+}
+
+############################################################
+# 8) continuous features: immune / CIN
+############################################################
+
+corr_results <- list()
+
+corr_results[["ESTIMATE_Immune"]] <- plot_corr_feature(
+  dat,
+  "ESTIMATE_Immune",
+  "ESTIMATE immune score",
+  "ENPP1_vs_ESTIMATE_Immune"
+)
+
+corr_results[["XCELL_Immune"]] <- plot_corr_feature(
+  dat,
+  "XCELL_Immune",
+  "xCell immune score",
+  "ENPP1_vs_XCELL_Immune"
+)
+
+corr_results[["CIN"]] <- plot_corr_feature(
+  dat,
+  "CIN",
+  "Chromosome instability index (CIN)",
+  "ENPP1_vs_CIN"
+)
+
+corr_summary <- bind_rows(corr_results)
+
+fwrite(
+  corr_summary,
+  file.path(outdir, "Continuous_feature_correlation_summary_no_stromal_no_stemness.tsv"),
+  sep = "\t"
+)
+
+############################################################
+# 9) binary receptor/TNBC states
+############################################################
+
+plot_binary_group(
+  dat,
+  "ER_status",
+  "ER status",
+  "ENPP1_by_ER_status"
+)
+
+plot_binary_group(
+  dat,
+  "PR_status",
+  "PR status",
+  "ENPP1_by_PR_status"
+)
+
+plot_binary_group(
+  dat,
+  "HER2_status",
+  "HER2 status",
+  "ENPP1_by_HER2_status"
+)
+
+plot_binary_group(
+  dat,
+  "TNBC_status",
+  "TNBC status",
+  "ENPP1_by_TNBC_status"
+)
+
+############################################################
+# 10) ER/HER2 combined groups
+############################################################
+
+dat_combo <- dat %>%
+  mutate(
+    ER_HER2_group = case_when(
+      ER_status == "Positive" & HER2_status == "Positive" ~ "ER+/HER2+",
+      ER_status == "Positive" & HER2_status == "Negative" ~ "ER+/HER2-",
+      ER_status == "Negative" & HER2_status == "Positive" ~ "ER-/HER2+",
+      ER_status == "Negative" & HER2_status == "Negative" ~ "ER-/HER2-",
+      TRUE ~ NA_character_
+    )
+  )
+
+df_combo <- dat_combo %>%
+  filter(!is.na(ENPP1_protein), !is.na(ER_HER2_group))
+
+if (nrow(df_combo) >= 10) {
+  
+  combo_stats <- df_combo %>%
+    group_by(ER_HER2_group) %>%
+    summarise(
+      n = n(),
+      median_ENPP1 = median(ENPP1_protein, na.rm = TRUE),
+      mean_ENPP1 = mean(ENPP1_protein, na.rm = TRUE),
+      .groups = "drop"
+    )
+  
+  fwrite(
+    combo_stats,
+    file.path(outdir, "ENPP1_by_ER_HER2_group_summary.tsv"),
+    sep = "\t"
+  )
+  
+  p_combo <- ggplot(
+    df_combo,
+    aes(
+      x = ER_HER2_group,
+      y = ENPP1_protein,
+      fill = ER_HER2_group
+    )
+  ) +
+    geom_violin(trim = FALSE, alpha = 0.5) +
+    geom_boxplot(width = 0.18, outlier.shape = NA, alpha = 0.8) +
+    geom_jitter(width = 0.10, size = 1.5, alpha = 0.7) +
+    stat_compare_means(method = "kruskal.test") +
+    theme_classic(base_size = 13) +
+    labs(
+      title = "ENPP1 protein by ER/HER2 combined group",
+      x = "",
+      y = "Normalized ENPP1 protein expression"
+    ) +
+    theme(legend.position = "none")
+  
+  ggsave(
+    file.path(outdir, "ENPP1_by_ER_HER2_group.pdf"),
+    p_combo,
+    width = 6,
+    height = 5
+  )
+}
+
+############################################################
+# 11) subtype-stratified correlations: summary only
+############################################################
+
+subtypes_to_run <- c(
+  "Luminal A",
+  "Luminal B",
+  "HER2-enriched",
+  "Basal/TNBC",
+  "Normal-like"
+)
+
+features_to_run <- c(
+  "ESTIMATE_Immune",
+  "XCELL_Immune",
+  "CIN"
+)
+
+sub_corr_res <- list()
+
+for (st in subtypes_to_run) {
+  
+  df_sub <- dat %>%
+    filter(Subtype == st)
+  
+  if (nrow(df_sub) < 8) next
+  
+  for (feat in features_to_run) {
+    
+    df_tmp <- df_sub %>%
+      filter(
+        !is.na(ENPP1_protein),
+        !is.na(.data[[feat]])
+      )
+    
+    if (nrow(df_tmp) < 8) next
+    
+    ct <- tryCatch(
+      cor.test(
+        df_tmp$ENPP1_protein,
+        df_tmp[[feat]],
+        method = "spearman"
+      ),
+      error = function(e) NULL
+    )
+    
+    if (is.null(ct)) next
+    
+    sub_corr_res[[paste(st, feat, sep = "__")]] <- data.frame(
+      Subtype = st,
+      Feature = feat,
+      N = nrow(df_tmp),
+      Spearman_rho = unname(ct$estimate),
+      P_value = ct$p.value
+    )
+  }
+}
+
+if (length(sub_corr_res) > 0) {
+  
+  sub_corr_summary <- bind_rows(sub_corr_res)
+  
+  fwrite(
+    sub_corr_summary,
+    file.path(outdir, "Subtype_specific_continuous_feature_correlations_no_stromal_no_stemness.tsv"),
+    sep = "\t"
+  )
+}
+
+############################################################
+# 12) subtype-specific scatter plots
+############################################################
+
+outdir2 <- file.path(outdir, "Subtype_specific_feature_scatter")
+dir.create(outdir2, showWarnings = FALSE)
+
+feature_labels <- c(
+  ESTIMATE_Immune = "ESTIMATE immune score",
+  XCELL_Immune = "xCell immune score",
+  CIN = "Chromosome instability index (CIN)"
+)
+
+sub_corr_res2 <- list()
+
+for (st in subtypes_to_run) {
+  
+  df_sub <- dat %>%
+    filter(Subtype == st)
+  
+  cat("===== subtype:", st, "=====\n")
+  cat("n =", nrow(df_sub), "\n")
+  
+  if (nrow(df_sub) < 8) next
+  
+  for (feat in features_to_run) {
+    
+    df_tmp <- df_sub %>%
+      filter(
+        !is.na(ENPP1_protein),
+        !is.na(.data[[feat]])
+      )
+    
+    if (nrow(df_tmp) < 8) next
+    
+    ct <- tryCatch(
+      cor.test(
+        df_tmp$ENPP1_protein,
+        df_tmp[[feat]],
+        method = "spearman"
+      ),
+      error = function(e) NULL
+    )
+    
+    if (is.null(ct)) next
+    
+    sub_corr_res2[[paste(st, feat, sep = "__")]] <- data.frame(
+      Subtype = st,
+      Feature = feat,
+      N = nrow(df_tmp),
+      Spearman_rho = unname(ct$estimate),
+      P_value = ct$p.value
+    )
+    
+    p <- ggplot(
+      df_tmp,
+      aes(x = ENPP1_protein, y = .data[[feat]])
+    ) +
+      geom_point(alpha = 0.75, size = 2) +
+      geom_smooth(method = "lm", se = FALSE) +
+      theme_classic(base_size = 13) +
+      labs(
+        title = paste0(
+          st,
+          ": ENPP1 vs ",
+          feature_labels[[feat]],
+          "\n",
+          "rho = ",
+          round(ct$estimate, 3),
+          ", p = ",
+          signif(ct$p.value, 3)
+        ),
+        x = "Normalized ENPP1 protein expression",
+        y = feature_labels[[feat]]
+      )
+    
+    ggsave(
+      file.path(
+        outdir2,
+        paste0(
+          gsub("[/ ]", "_", st),
+          "_ENPP1_vs_",
+          feat,
+          ".pdf"
+        )
+      ),
+      p,
+      width = 6,
+      height = 5
+    )
+  }
+}
+
+if (length(sub_corr_res2) > 0) {
+  
+  sub_corr_summary2 <- bind_rows(sub_corr_res2) %>%
+    arrange(Feature, P_value)
+  
+  fwrite(
+    sub_corr_summary2,
+    file.path(outdir2, "Subtype_specific_continuous_feature_correlations_no_stromal_no_stemness.tsv"),
+    sep = "\t"
+  )
+}
+
+############################################################
+# 13) done
+############################################################
+
+cat("===== DONE =====\n")
+cat("Main results:\n")
+print(list.files(outdir))
+
+cat("Subtype-specific scatter results:\n")
+print(list.files(outdir2))
