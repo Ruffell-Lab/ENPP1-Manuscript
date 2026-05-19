@@ -1,0 +1,308 @@
+############################################################
+## SCAN-B Basal only
+## ENPP1 quartile 3 groups vs OS
+## Groups: bottom 25%, middle 50%, top 25%
+############################################################
+
+rm(list = ls())
+
+############################################################
+## 0. Packages
+############################################################
+
+pkgs <- c(
+  "data.table", "readxl", "stringr", "GEOquery",
+  "ggplot2", "survival", "survminer"
+)
+
+for (p in pkgs) {
+  if (!requireNamespace(p, quietly = TRUE)) install.packages(p)
+}
+
+library(data.table)
+library(readxl)
+library(stringr)
+library(GEOquery)
+library(ggplot2)
+library(survival)
+library(survminer)
+
+options(stringsAsFactors = FALSE)
+
+############################################################
+## 1. Output folder
+############################################################
+
+outdir <- path.expand("~/Desktop/ENPP1_OS_quartile_3groups")
+dir.create(outdir, showWarnings = FALSE, recursive = TRUE)
+
+KM_XLIM <- c(0, 3000)
+KM_XBREAK <- 500
+KM_YLIM <- c(0, 1)
+
+############################################################
+## 2. Choose files
+############################################################
+
+cat("Choose SupplementaryDataTable.xlsx ...\n")
+cohort_xlsx <- file.choose()
+
+cat("Choose WGS-RNA mapping txt/tsv file ...\n")
+map_file <- file.choose()
+
+cat("Choose GSE96058 gene_expression_transformed.csv ...\n")
+expr_file <- file.choose()
+
+############################################################
+## 3. Read clinical data
+############################################################
+
+cs <- as.data.table(read_excel(cohort_xlsx, sheet = "PatientDataTable"))
+
+find_pd_col <- function(dt) {
+  for (nm in names(dt)) {
+    v <- as.character(dt[[nm]])
+    v <- v[!is.na(v)]
+    if (length(v) > 0 && mean(grepl("^PD\\d+", v)) > 0.3) return(nm)
+  }
+  return(NA_character_)
+}
+
+pd_col <- find_pd_col(cs)
+if (is.na(pd_col)) stop("Cannot find PD_ID column.")
+
+clin <- cs[, .(
+  PD_ID = as.character(get(pd_col)),
+  PAM50_AIMS = as.character(PAM50_AIMS),
+  TumorAssay = as.character(TumorAssay),
+  OS_time_year = as.numeric(OS),
+  OS_event = as.integer(OSbin)
+)]
+
+clin <- unique(clin[!is.na(PD_ID) & PD_ID != ""])
+clin[, OS_time_day := OS_time_year * 365.25]
+
+############################################################
+## 4. Read WGS-RNA mapping
+############################################################
+
+map <- fread(map_file)
+
+mapping <- unique(map[
+  !is.na(PD_ID) & !is.na(External_ID_rba),
+  .(
+    PD_ID = as.character(PD_ID),
+    RNAseq_external_id = as.character(External_ID_rba)
+  )
+])
+
+clin_map <- merge(clin, mapping, by = "PD_ID")
+
+############################################################
+## 5. Read ENPP1 expression
+############################################################
+
+expr <- fread(expr_file)
+
+find_gene_col <- function(dt) {
+  for (nm in names(dt)) {
+    if ("ENPP1" %in% as.character(dt[[nm]])) return(nm)
+  }
+  return(NA_character_)
+}
+
+gene_col <- find_gene_col(expr)
+if (is.na(gene_col)) stop("Cannot find gene column containing ENPP1.")
+
+enpp1_row <- expr[get(gene_col) == "ENPP1"][1]
+
+sample_cols <- setdiff(names(enpp1_row), gene_col)
+
+enpp1_long <- melt(
+  enpp1_row,
+  id.vars = gene_col,
+  measure.vars = sample_cols,
+  variable.name = "F_ID",
+  value.name = "ENPP1"
+)
+
+enpp1_long[, ENPP1 := as.numeric(ENPP1)]
+enpp1_long <- enpp1_long[!is.na(ENPP1) & grepl("^F\\d+", F_ID)]
+
+enpp1_long[, F_core := str_replace(as.character(F_ID), "rep\\d+$", "")]
+
+enpp1_F <- enpp1_long[, .(
+  ENPP1 = mean(ENPP1, na.rm = TRUE)
+), by = F_core]
+
+setnames(enpp1_F, "F_core", "F_ID")
+
+############################################################
+## 6. GEO metadata: F_ID to RNAseq_external_id
+############################################################
+
+cat("Downloading GEO metadata for GSE96058 ...\n")
+gse <- getGEO("GSE96058", GSEMatrix = TRUE)
+
+pd_all <- rbindlist(
+  lapply(gse, function(x) as.data.table(pData(x))),
+  fill = TRUE
+)
+
+pd_all[, blob := do.call(paste, c(.SD, sep = " | ")), .SDcols = names(pd_all)]
+
+pd_all[, F_ID := str_extract(blob, "F\\d+(?:rep\\d+)?")]
+pd_all[, RNAseq_external_id := str_extract(blob, "S\\d{6}[^\\s\\|]*")]
+
+geo_map <- unique(pd_all[
+  !is.na(F_ID) & !is.na(RNAseq_external_id),
+  .(F_ID, RNAseq_external_id)
+])
+
+############################################################
+## 7. Merge clinical + expression
+############################################################
+
+tmp <- merge(clin_map, geo_map, by = "RNAseq_external_id")
+final_df <- merge(tmp, enpp1_F, by = "F_ID")
+final_df <- unique(final_df, by = "PD_ID")
+
+dat <- final_df[PAM50_AIMS == "Basal"]
+
+dat <- dat[
+  !is.na(ENPP1) &
+    !is.na(OS_time_day) &
+    !is.na(OS_event) &
+    OS_time_day > 0
+]
+
+cat("Basal sample size for OS:", nrow(dat), "\n")
+print(table(dat$OS_event, useNA = "ifany"))
+
+############################################################
+## 8. ENPP1 bottom 25%, middle 50%, top 25%
+############################################################
+
+q1 <- quantile(dat$ENPP1, 0.25, na.rm = TRUE)
+q3 <- quantile(dat$ENPP1, 0.75, na.rm = TRUE)
+
+dat[, ENPP1_group := fifelse(
+  ENPP1 <= q1,
+  "Bottom 25%",
+  fifelse(
+    ENPP1 >= q3,
+    "Top 25%",
+    "Middle 50%"
+  )
+)]
+
+dat[, ENPP1_group := factor(
+  ENPP1_group,
+  levels = c("Bottom 25%", "Middle 50%", "Top 25%")
+)]
+
+cat("ENPP1 group counts:\n")
+print(table(dat$ENPP1_group))
+
+############################################################
+## 9. Pairwise log-rank test
+############################################################
+
+pairwise_logrank <- function(d) {
+  groups <- levels(d$ENPP1_group)
+  pairs <- combn(groups, 2, simplify = FALSE)
+
+  res <- rbindlist(lapply(pairs, function(pair) {
+    dd <- d[ENPP1_group %in% pair]
+    dd[, group2 := droplevels(factor(ENPP1_group, levels = pair))]
+
+    fit <- survdiff(Surv(OS_time_day, OS_event) ~ group2, data = dd)
+    pval <- 1 - pchisq(fit$chisq, df = 1)
+
+    data.table(
+      comparison = paste(pair, collapse = " vs "),
+      n1 = sum(dd$group2 == pair[1]),
+      n2 = sum(dd$group2 == pair[2]),
+      chisq = fit$chisq,
+      p_value = pval
+    )
+  }))
+
+  return(res)
+}
+
+pw <- pairwise_logrank(dat)
+print(pw)
+
+fwrite(pw, file.path(outdir, "ENPP1_quartile_3groups_OS_pairwise_logrank.csv"))
+fwrite(dat, file.path(outdir, "SCANB_basal_ENPP1_quartile_3groups_OS_data.csv"))
+
+############################################################
+## 10. KM plot
+############################################################
+
+fit <- survfit(Surv(OS_time_day, OS_event) ~ ENPP1_group, data = dat)
+
+n_tab <- table(dat$ENPP1_group)
+
+legend_labs <- paste0(
+  names(n_tab),
+  " (n=", as.integer(n_tab), ")"
+)
+
+p_label <- paste0(
+  "Pairwise log-rank:\n",
+  paste0(
+    pw$comparison,
+    ": p = ",
+    signif(pw$p_value, 3),
+    collapse = "\n"
+  )
+)
+
+p <- ggsurvplot(
+  fit,
+  data = dat,
+  pval = FALSE,
+  risk.table = FALSE,
+  conf.int = FALSE,
+  censor = TRUE,
+  palette = c("#00BFC4", "grey55", "#F8766D"),
+  legend.title = "",
+  legend.labs = legend_labs,
+  ggtheme = theme_classic(base_size = 14),
+  title = "SCAN-B Basal | ENPP1 quartile groups | OS",
+  xlab = "Time (days)",
+  ylab = "Overall survival probability",
+  break.time.by = KM_XBREAK,
+  xlim = KM_XLIM,
+  ylim = KM_YLIM
+)
+
+p$plot <- p$plot +
+  annotate(
+    "text",
+    x = KM_XLIM[2] * 0.98,
+    y = 0.18,
+    hjust = 1,
+    label = paste0(
+      "Q1 = ", round(q1, 3),
+      "; Q3 = ", round(q3, 3),
+      "\n", p_label
+    ),
+    size = 3.5
+  ) +
+  theme(
+    plot.title = element_text(size = 13, face = "bold", hjust = 0.5),
+    legend.position = "bottom",
+    plot.margin = margin(8, 28, 5, 10)
+  )
+
+ggsave(
+  filename = file.path(outdir, "SCANB_basal_ENPP1_quartile_3groups_OS.pdf"),
+  plot = p$plot,
+  width = 7.8,
+  height = 5.1
+)
+
+cat("\nDone. Files saved to:\n", outdir, "\n")
