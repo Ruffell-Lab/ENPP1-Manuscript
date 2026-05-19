@@ -1,0 +1,655 @@
+############################################################
+## TCGA-BRCA
+## BRCA1/2 functional loss:
+## BRCA1/2 nonsilent mutation OR BRCA1 promoter methylation beta > 0.2
+## ENPP1 vs OS
+############################################################
+
+suppressPackageStartupMessages({
+  library(data.table)
+  library(dplyr)
+  library(tidyr)
+  library(stringr)
+  library(ggplot2)
+  library(survival)
+  library(survminer)
+})
+
+############################################################
+## 0. Paths
+############################################################
+
+datadir <- "~/Desktop/Q2"
+
+clin_file <- file.path(datadir, "data_clinical_patient.txt")
+expr_file <- file.path(datadir, "data_mrna_seq_v2_rsem.txt")
+mut_file  <- file.path(datadir, "data_mutations.txt")
+meth_file <- file.path(datadir, "TCGA-BRCA.methylation450.tsv.gz")
+
+outdir <- file.path(datadir, "BRCA12_FL_beta020_OS_no_tail")
+dir.create(outdir, recursive = TRUE, showWarnings = FALSE)
+
+stopifnot(file.exists(clin_file))
+stopifnot(file.exists(expr_file))
+stopifnot(file.exists(mut_file))
+stopifnot(file.exists(meth_file))
+
+as_patient12 <- function(x) {
+  x <- as.character(x)
+  x <- gsub("\\.", "-", x)
+  substr(x, 1, 12)
+}
+
+############################################################
+## 1. Clinical OS
+############################################################
+
+clin_raw <- fread(
+  clin_file,
+  sep = "\t",
+  header = TRUE,
+  skip = 4,
+  data.table = FALSE
+)
+
+clin <- clin_raw %>%
+  transmute(
+    patient12 = as_patient12(PATIENT_ID),
+    OS_months = suppressWarnings(as.numeric(OS_MONTHS)),
+    OS_status_raw = as.character(OS_STATUS)
+  ) %>%
+  mutate(
+    OS_status_upper = toupper(OS_status_raw),
+    OS_event = ifelse(grepl("DECEASED", OS_status_upper), 1, 0)
+  ) %>%
+  filter(!is.na(patient12), !is.na(OS_months), !is.na(OS_event)) %>%
+  distinct(patient12, .keep_all = TRUE)
+
+cat("\nClinical patients with OS:\n")
+print(nrow(clin))
+print(table(clin$OS_event))
+
+############################################################
+## 2. BRCA1/2 mutation
+############################################################
+
+mut_raw <- fread(
+  mut_file,
+  sep = "\t",
+  header = TRUE,
+  data.table = FALSE,
+  quote = ""
+)
+
+mut_nm <- colnames(mut_raw)
+
+sample_col <- if ("Tumor_Sample_Barcode" %in% mut_nm) {
+  "Tumor_Sample_Barcode"
+} else if ("SAMPLE_ID" %in% mut_nm) {
+  "SAMPLE_ID"
+} else {
+  stop("No sample column in mutation file.")
+}
+
+gene_col <- if ("Hugo_Symbol" %in% mut_nm) {
+  "Hugo_Symbol"
+} else {
+  stop("No Hugo_Symbol column in mutation file.")
+}
+
+class_col <- if ("Variant_Classification" %in% mut_nm) {
+  "Variant_Classification"
+} else {
+  stop("No Variant_Classification column in mutation file.")
+}
+
+nonsilent_classes <- c(
+  "Frame_Shift_Del",
+  "Frame_Shift_Ins",
+  "In_Frame_Del",
+  "In_Frame_Ins",
+  "Missense_Mutation",
+  "Nonsense_Mutation",
+  "Nonstop_Mutation",
+  "Splice_Site",
+  "Translation_Start_Site"
+)
+
+brca_mut_status <- mut_raw %>%
+  transmute(
+    patient12 = as_patient12(.data[[sample_col]]),
+    gene = toupper(as.character(.data[[gene_col]])),
+    variant_class = as.character(.data[[class_col]])
+  ) %>%
+  filter(gene %in% c("BRCA1", "BRCA2")) %>%
+  mutate(nonsilent = variant_class %in% nonsilent_classes) %>%
+  filter(nonsilent) %>%
+  group_by(patient12) %>%
+  summarise(
+    BRCA1_mut = any(gene == "BRCA1"),
+    BRCA2_mut = any(gene == "BRCA2"),
+    .groups = "drop"
+  )
+
+############################################################
+## 3. BRCA1 promoter methylation beta > 0.2
+## extract only BRCA1 promoter probes
+############################################################
+
+if (!requireNamespace("BiocManager", quietly = TRUE)) {
+  install.packages("BiocManager")
+}
+
+if (!requireNamespace("IlluminaHumanMethylation450kanno.ilmn12.hg19", quietly = TRUE)) {
+  BiocManager::install("IlluminaHumanMethylation450kanno.ilmn12.hg19")
+}
+
+library(IlluminaHumanMethylation450kanno.ilmn12.hg19)
+
+anno <- getAnnotation(IlluminaHumanMethylation450kanno.ilmn12.hg19)
+anno <- as.data.frame(anno)
+anno$probe_id <- rownames(anno)
+
+brca1_anno <- anno %>%
+  filter(
+    grepl("BRCA1", UCSC_RefGene_Name, ignore.case = TRUE),
+    grepl(
+      "TSS200|TSS1500|5'UTR|1stExon",
+      UCSC_RefGene_Group,
+      ignore.case = TRUE
+    )
+  )
+
+brca1_promoter_probes <- unique(brca1_anno$probe_id)
+
+cat("\nBRCA1 promoter probes detected:\n")
+print(length(brca1_promoter_probes))
+
+write.csv(
+  brca1_anno,
+  file.path(outdir, "BRCA1_HM450_promoter_probe_annotation.csv"),
+  row.names = FALSE
+)
+
+tmp_meth_file <- file.path(outdir, "BRCA1_promoter_methylation_only.tsv")
+
+con_in <- gzfile(meth_file, open = "rt")
+con_out <- file(tmp_meth_file, open = "wt")
+
+header <- readLines(con_in, n = 1)
+writeLines(header, con_out)
+
+n_keep <- 0
+
+repeat {
+  lines <- readLines(con_in, n = 5000)
+  if (length(lines) == 0) break
+  
+  probe_ids <- sub("\t.*$", "", lines)
+  keep <- probe_ids %in% brca1_promoter_probes
+  
+  if (any(keep)) {
+    writeLines(lines[keep], con_out)
+    n_keep <- n_keep + sum(keep)
+  }
+}
+
+close(con_in)
+close(con_out)
+
+cat("\nBRCA1 promoter probe rows written:\n")
+print(n_keep)
+
+meth_raw <- fread(
+  tmp_meth_file,
+  sep = "\t",
+  header = TRUE
+)
+
+probe_id_col <- "Composite Element REF"
+
+sample_meth_cols <- colnames(meth_raw)[
+  grepl("^TCGA", colnames(meth_raw))
+]
+
+meth_long <- melt(
+  meth_raw,
+  id.vars = probe_id_col,
+  measure.vars = sample_meth_cols,
+  variable.name = "sample",
+  value.name = "beta"
+)
+
+meth_long[, patient12 := as_patient12(sample)]
+meth_long[, beta := as.numeric(beta)]
+meth_long <- meth_long[!is.na(beta)]
+
+brca1_meth_status <- meth_long[
+  ,
+  .(
+    BRCA1_meth_beta = median(beta, na.rm = TRUE),
+    n_probes = uniqueN(get(probe_id_col))
+  ),
+  by = patient12
+]
+
+brca1_meth_status[
+  ,
+  BRCA1_promoter_hypermethylated := BRCA1_meth_beta > 0.2
+]
+
+cat("\nBRCA1 promoter methylation beta summary:\n")
+print(summary(brca1_meth_status$BRCA1_meth_beta))
+
+cat("\nBRCA1 promoter hypermethylation beta > 0.2:\n")
+print(table(brca1_meth_status$BRCA1_promoter_hypermethylated))
+
+write.csv(
+  brca1_meth_status,
+  file.path(outdir, "BRCA1_promoter_methylation_beta020_status.csv"),
+  row.names = FALSE
+)
+
+############################################################
+## 4. ENPP1 expression
+############################################################
+
+expr_raw <- fread(
+  expr_file,
+  sep = "\t",
+  header = TRUE,
+  data.table = FALSE
+)
+
+cat("\nExpression columns:\n")
+print(colnames(expr_raw)[1:10])
+
+gene_expr_col <- if ("Hugo_Symbol" %in% colnames(expr_raw)) {
+  "Hugo_Symbol"
+} else if ("Hugo.Symbol" %in% colnames(expr_raw)) {
+  "Hugo.Symbol"
+} else {
+  colnames(expr_raw)[1]
+}
+
+enpp1_row <- expr_raw %>%
+  filter(toupper(.data[[gene_expr_col]]) == "ENPP1")
+
+cat("\nENPP1 rows detected:\n")
+print(nrow(enpp1_row))
+
+if (nrow(enpp1_row) != 1) {
+  stop("ENPP1 row not uniquely detected.")
+}
+
+expr_sample_cols <- colnames(expr_raw)[
+  grepl("^TCGA", colnames(expr_raw))
+]
+
+enpp1_expr <- enpp1_row %>%
+  select(all_of(expr_sample_cols)) %>%
+  pivot_longer(
+    cols = everything(),
+    names_to = "sample",
+    values_to = "ENPP1_RSEM"
+  ) %>%
+  mutate(
+    patient12 = as_patient12(sample),
+    ENPP1_RSEM = suppressWarnings(as.numeric(ENPP1_RSEM)),
+    ENPP1_log2 = log2(ENPP1_RSEM + 1)
+  ) %>%
+  filter(!is.na(ENPP1_log2)) %>%
+  group_by(patient12) %>%
+  summarise(
+    ENPP1_RSEM = median(ENPP1_RSEM, na.rm = TRUE),
+    ENPP1_log2 = median(ENPP1_log2, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+cat("\nPatients with ENPP1 expression:\n")
+print(nrow(enpp1_expr))
+
+############################################################
+## 5. Merge all
+############################################################
+
+dat <- clin %>%
+  left_join(brca_mut_status, by = "patient12") %>%
+  left_join(as.data.frame(brca1_meth_status), by = "patient12") %>%
+  left_join(enpp1_expr, by = "patient12") %>%
+  mutate(
+    BRCA1_mut = ifelse(is.na(BRCA1_mut), FALSE, BRCA1_mut),
+    BRCA2_mut = ifelse(is.na(BRCA2_mut), FALSE, BRCA2_mut),
+    BRCA1_promoter_hypermethylated = ifelse(
+      is.na(BRCA1_promoter_hypermethylated),
+      FALSE,
+      BRCA1_promoter_hypermethylated
+    ),
+    BRCA1_function_loss = BRCA1_mut | BRCA1_promoter_hypermethylated,
+    BRCA12_function_loss = BRCA1_mut | BRCA2_mut | BRCA1_promoter_hypermethylated,
+    BRCA1_FL_group = ifelse(
+      BRCA1_function_loss,
+      "BRCA1 functional loss",
+      "BRCA1 WT"
+    ),
+    BRCA12_FL_group = ifelse(
+      BRCA12_function_loss,
+      "BRCA1/2 functional loss",
+      "BRCA1/2 WT"
+    )
+  ) %>%
+  filter(!is.na(OS_months), !is.na(OS_event), !is.na(ENPP1_log2))
+
+cat("\nFinal merged dataset:\n")
+print(nrow(dat))
+
+cat("\nBRCA1 mutation:\n")
+print(table(dat$BRCA1_mut))
+
+cat("\nBRCA2 mutation:\n")
+print(table(dat$BRCA2_mut))
+
+cat("\nBRCA1 promoter hypermethylation beta > 0.2:\n")
+print(table(dat$BRCA1_promoter_hypermethylated))
+
+cat("\nBRCA1 functional loss:\n")
+print(table(dat$BRCA1_function_loss))
+
+cat("\nBRCA1/2 functional loss:\n")
+print(table(dat$BRCA12_function_loss))
+
+write.csv(
+  dat,
+  file.path(outdir, "TCGA_BRCA_ENPP1_BRCA12_function_loss_beta020_OS_merged.csv"),
+  row.names = FALSE
+)
+
+############################################################
+## 6. Summary table
+############################################################
+
+summary_table <- dat %>%
+  summarise(
+    total_n = n(),
+    total_events = sum(OS_event),
+    
+    BRCA1_mut_n = sum(BRCA1_mut),
+    BRCA2_mut_n = sum(BRCA2_mut),
+    BRCA1_methyl_beta020_n = sum(BRCA1_promoter_hypermethylated),
+    
+    BRCA1_FL_n = sum(BRCA1_function_loss),
+    BRCA1_FL_events = sum(OS_event[BRCA1_function_loss]),
+    
+    BRCA12_FL_n = sum(BRCA12_function_loss),
+    BRCA12_FL_events = sum(OS_event[BRCA12_function_loss])
+  )
+
+write.csv(
+  summary_table,
+  file.path(outdir, "summary_counts_beta020.csv"),
+  row.names = FALSE
+)
+
+print(summary_table)
+
+############################################################
+## 7. KM plotting function
+## remove tail effect by truncating x-axis when at-risk < min_risk
+############################################################
+
+get_tail_cutoff <- function(df, min_risk = 5) {
+  
+  d <- df %>%
+    filter(!is.na(OS_months), !is.na(OS_event))
+  
+  event_times <- sort(unique(d$OS_months))
+  
+  risk_n <- sapply(event_times, function(t) {
+    sum(d$OS_months >= t)
+  })
+  
+  ok_times <- event_times[risk_n >= min_risk]
+  
+  if (length(ok_times) == 0) {
+    return(max(d$OS_months, na.rm = TRUE))
+  }
+  
+  max(ok_times, na.rm = TRUE)
+}
+
+make_km <- function(
+    df,
+    group_name,
+    split_method = c("median", "top_bottom_25", "best_cut"),
+    min_risk_tail = 5
+) {
+  
+  split_method <- match.arg(split_method)
+  
+  d <- df %>%
+    filter(
+      !is.na(ENPP1_log2),
+      !is.na(OS_months),
+      !is.na(OS_event)
+    )
+  
+  if (nrow(d) < 10) {
+    message(group_name, ": too few samples")
+    return(NULL)
+  }
+  
+  if (sum(d$OS_event) < 2) {
+    message(group_name, ": too few events")
+    return(NULL)
+  }
+  
+  if (split_method == "median") {
+    
+    cut <- median(d$ENPP1_log2, na.rm = TRUE)
+    
+    d <- d %>%
+      mutate(
+        ENPP1_group = ifelse(ENPP1_log2 >= cut, "High", "Low")
+      )
+    
+    subtitle <- paste0("median cut = ", round(cut, 3))
+  }
+  
+  if (split_method == "top_bottom_25") {
+    
+    q25 <- quantile(d$ENPP1_log2, 0.25, na.rm = TRUE)
+    q75 <- quantile(d$ENPP1_log2, 0.75, na.rm = TRUE)
+    
+    d <- d %>%
+      mutate(
+        ENPP1_group = case_when(
+          ENPP1_log2 <= q25 ~ "Low",
+          ENPP1_log2 >= q75 ~ "High",
+          TRUE ~ NA_character_
+        )
+      ) %>%
+      filter(!is.na(ENPP1_group))
+    
+    subtitle <- paste0(
+      "bottom 25% vs top 25%; q25=",
+      round(q25, 3),
+      ", q75=",
+      round(q75, 3)
+    )
+  }
+  
+  if (split_method == "best_cut") {
+    
+    cuts <- quantile(
+      d$ENPP1_log2,
+      probs = seq(0.1, 0.9, 0.01),
+      na.rm = TRUE
+    )
+    
+    cuts <- unique(as.numeric(cuts))
+    
+    best_list <- lapply(cuts, function(cut) {
+      
+      tmp <- d %>%
+        mutate(
+          ENPP1_group = ifelse(ENPP1_log2 >= cut, "High", "Low")
+        )
+      
+      if (length(unique(tmp$ENPP1_group)) < 2) return(NULL)
+      if (min(table(tmp$ENPP1_group)) < 5) return(NULL)
+      
+      sd <- survdiff(
+        Surv(OS_months, OS_event) ~ ENPP1_group,
+        data = tmp
+      )
+      
+      p <- pchisq(sd$chisq, df = 1, lower.tail = FALSE)
+      
+      data.frame(
+        cut = as.numeric(cut),
+        p = as.numeric(p),
+        chisq = as.numeric(sd$chisq)
+      )
+    })
+    
+    best <- bind_rows(best_list)
+    
+    if (nrow(best) == 0) {
+      message(group_name, ": no valid best cut")
+      return(NULL)
+    }
+    
+    best <- best[order(best$p), , drop = FALSE]
+    best_cut <- best$cut[1]
+    
+    d <- d %>%
+      mutate(
+        ENPP1_group = ifelse(ENPP1_log2 >= best_cut, "High", "Low")
+      )
+    
+    subtitle <- paste0("best log2 cut = ", round(best_cut, 3))
+    
+    write.csv(
+      best,
+      file.path(
+        outdir,
+        paste0(
+          "best_cut_table_",
+          gsub("[^A-Za-z0-9]+", "_", group_name),
+          ".csv"
+        )
+      ),
+      row.names = FALSE
+    )
+  }
+  
+  d$ENPP1_group <- factor(d$ENPP1_group, levels = c("Low", "High"))
+  
+  if (length(unique(d$ENPP1_group)) < 2) {
+    message(group_name, ": only one ENPP1 group")
+    return(NULL)
+  }
+  
+  if (min(table(d$ENPP1_group)) < 2) {
+    message(group_name, ": one ENPP1 group too small")
+    return(NULL)
+  }
+  
+  fit <- survfit(
+    Surv(OS_months, OS_event) ~ ENPP1_group,
+    data = d
+  )
+  
+  sdiff <- survdiff(
+    Surv(OS_months, OS_event) ~ ENPP1_group,
+    data = d
+  )
+  
+  pval <- pchisq(
+    sdiff$chisq,
+    df = 1,
+    lower.tail = FALSE
+  )
+  
+  n_low <- sum(d$ENPP1_group == "Low")
+  n_high <- sum(d$ENPP1_group == "High")
+  
+  e_low <- sum(d$OS_event[d$ENPP1_group == "Low"])
+  e_high <- sum(d$OS_event[d$ENPP1_group == "High"])
+  
+  x_cut <- get_tail_cutoff(d, min_risk = min_risk_tail)
+  
+  p <- ggsurvplot(
+    fit,
+    data = d,
+    risk.table = TRUE,
+    conf.int = FALSE,
+    censor = TRUE,
+    pval = paste0("log-rank p = ", signif(pval, 3)),
+    palette = c("#00BFC4", "#F8766D"),
+    legend.title = "",
+    legend.labs = c(
+      paste0("Low (n=", n_low, ", events=", e_low, ")"),
+      paste0("High (n=", n_high, ", events=", e_high, ")")
+    ),
+    xlab = "Months",
+    ylab = "Overall survival probability",
+    title = paste0(
+      group_name,
+      "\nENPP1 ",
+      subtitle,
+      "\nCurve truncated when total at-risk < ",
+      min_risk_tail
+    ),
+    risk.table.height = 0.25,
+    xlim = c(0, x_cut),
+    break.time.by = 24
+  )
+  
+  filename <- paste0(
+    "KM_",
+    gsub("[^A-Za-z0-9]+", "_", group_name),
+    "_",
+    split_method,
+    "_no_tail.pdf"
+  )
+  
+  pdf(
+    file.path(outdir, filename),
+    width = 7.5,
+    height = 6.5
+  )
+  
+  print(p)
+  
+  dev.off()
+  
+  return(d)
+}
+
+############################################################
+## 8. Run KM analyses
+############################################################
+
+dat_brca1_wt <- dat %>% filter(!BRCA1_function_loss)
+dat_brca1_fl <- dat %>% filter(BRCA1_function_loss)
+
+dat_brca12_wt <- dat %>% filter(!BRCA12_function_loss)
+dat_brca12_fl <- dat %>% filter(BRCA12_function_loss)
+
+groups <- list(
+  "All_TCGA_BRCA" = dat,
+  "BRCA1_WT" = dat_brca1_wt,
+  "BRCA1_function_loss_beta020" = dat_brca1_fl,
+  "BRCA12_WT" = dat_brca12_wt,
+  "BRCA12_function_loss_beta020" = dat_brca12_fl
+)
+
+for (g in names(groups)) {
+  make_km(groups[[g]], g, "median", min_risk_tail = 5)
+  make_km(groups[[g]], g, "top_bottom_25", min_risk_tail = 5)
+  make_km(groups[[g]], g, "best_cut", min_risk_tail = 5)
+}
+
+cat("\nDone. Results saved to:\n")
+cat(outdir, "\n")
