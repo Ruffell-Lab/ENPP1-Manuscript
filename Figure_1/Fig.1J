@@ -1,0 +1,444 @@
+############################################################
+## TCGA basal-like BC
+## ENPP1 expression
+## BRCA1 functional vs nonfunctional
+## BRCA1/2 functional vs nonfunctional
+############################################################
+
+suppressPackageStartupMessages({
+
+  library(data.table)
+  library(dplyr)
+  library(tidyr)
+  library(stringr)
+  library(ggplot2)
+
+})
+
+############################################################
+## 0. Paths
+############################################################
+
+datadir <- "~/Desktop/Q2"
+
+clin_file <- file.path(datadir, "data_clinical_patient.txt")
+expr_file <- file.path(datadir, "data_mrna_seq_v2_rsem.txt")
+mut_file  <- file.path(datadir, "data_mutations.txt")
+meth_file <- file.path(datadir, "TCGA-BRCA.methylation450.tsv.gz")
+
+outdir <- file.path(datadir, "Basal_ENPP1_BRCA_functional_expression")
+dir.create(outdir, recursive = TRUE, showWarnings = FALSE)
+
+############################################################
+## helper
+############################################################
+
+as_patient12 <- function(x) {
+
+  x <- as.character(x)
+  x <- gsub("\\.", "-", x)
+  substr(x, 1, 12)
+
+}
+
+############################################################
+## 1. Clinical + subtype
+############################################################
+
+clin_raw <- fread(
+  clin_file,
+  sep = "\t",
+  header = TRUE,
+  skip = 4,
+  data.table = FALSE
+)
+
+clin <- clin_raw %>%
+  transmute(
+    patient12 = as_patient12(PATIENT_ID),
+    SUBTYPE = as.character(SUBTYPE)
+  ) %>%
+  distinct(patient12, .keep_all = TRUE)
+
+############################################################
+## 2. BRCA1/2 nonsilent mutation
+############################################################
+
+mut_raw <- fread(
+  mut_file,
+  sep = "\t",
+  header = TRUE,
+  data.table = FALSE,
+  quote = ""
+)
+
+nonsilent_classes <- c(
+  "Frame_Shift_Del",
+  "Frame_Shift_Ins",
+  "In_Frame_Del",
+  "In_Frame_Ins",
+  "Missense_Mutation",
+  "Nonsense_Mutation",
+  "Nonstop_Mutation",
+  "Splice_Site",
+  "Translation_Start_Site"
+)
+
+brca_mut_status <- mut_raw %>%
+  transmute(
+    patient12 = as_patient12(Tumor_Sample_Barcode),
+    gene = toupper(Hugo_Symbol),
+    variant_class = Variant_Classification
+  ) %>%
+  filter(gene %in% c("BRCA1", "BRCA2")) %>%
+  mutate(
+    nonsilent = variant_class %in% nonsilent_classes
+  ) %>%
+  filter(nonsilent) %>%
+  group_by(patient12) %>%
+  summarise(
+    BRCA1_mut = any(gene == "BRCA1"),
+    BRCA2_mut = any(gene == "BRCA2"),
+    .groups = "drop"
+  )
+
+############################################################
+## 3. BRCA1 promoter methylation
+############################################################
+
+if (!requireNamespace("BiocManager", quietly = TRUE)) {
+  install.packages("BiocManager")
+}
+
+if (!requireNamespace(
+  "IlluminaHumanMethylation450kanno.ilmn12.hg19",
+  quietly = TRUE
+)) {
+  BiocManager::install(
+    "IlluminaHumanMethylation450kanno.ilmn12.hg19"
+  )
+}
+
+library(IlluminaHumanMethylation450kanno.ilmn12.hg19)
+
+anno <- getAnnotation(
+  IlluminaHumanMethylation450kanno.ilmn12.hg19
+)
+
+anno <- as.data.frame(anno)
+anno$probe_id <- rownames(anno)
+
+brca1_anno <- anno %>%
+  filter(
+    grepl("BRCA1", UCSC_RefGene_Name, ignore.case = TRUE),
+    grepl(
+      "TSS200|TSS1500|5'UTR|1stExon",
+      UCSC_RefGene_Group,
+      ignore.case = TRUE
+    )
+  )
+
+brca1_promoter_probes <- unique(brca1_anno$probe_id)
+
+meth_raw <- fread(
+  meth_file,
+  sep = "\t",
+  header = TRUE
+)
+
+probe_id_col <- "Composite Element REF"
+
+meth_raw <- meth_raw[
+  get(probe_id_col) %in% brca1_promoter_probes
+]
+
+sample_meth_cols <- colnames(meth_raw)[
+  grepl("^TCGA", colnames(meth_raw))
+]
+
+meth_long <- melt(
+  meth_raw,
+  id.vars = probe_id_col,
+  measure.vars = sample_meth_cols,
+  variable.name = "sample",
+  value.name = "beta"
+)
+
+meth_long[, patient12 := as_patient12(sample)]
+meth_long[, beta := as.numeric(beta)]
+
+meth_long <- meth_long[!is.na(beta)]
+
+brca1_meth_status <- meth_long[
+  ,
+  .(
+    BRCA1_meth_beta = median(beta, na.rm = TRUE)
+  ),
+  by = patient12
+]
+
+brca1_meth_status[
+  ,
+  BRCA1_promoter_hypermethylated :=
+    BRCA1_meth_beta > 0.2
+]
+
+############################################################
+## 4. ENPP1 expression
+############################################################
+
+expr_raw <- fread(
+  expr_file,
+  sep = "\t",
+  header = TRUE,
+  data.table = FALSE
+)
+
+enpp1_row <- expr_raw %>%
+  filter(Hugo_Symbol == "ENPP1")
+
+expr_sample_cols <- colnames(expr_raw)[
+  grepl("^TCGA", colnames(expr_raw))
+]
+
+enpp1_expr <- enpp1_row %>%
+  select(all_of(expr_sample_cols)) %>%
+  pivot_longer(
+    cols = everything(),
+    names_to = "sample",
+    values_to = "ENPP1_RSEM"
+  ) %>%
+  mutate(
+    patient12 = as_patient12(sample),
+    ENPP1_RSEM = as.numeric(ENPP1_RSEM),
+    ENPP1_log2 = log2(ENPP1_RSEM + 1)
+  ) %>%
+  filter(!is.na(ENPP1_log2)) %>%
+  group_by(patient12) %>%
+  summarise(
+    ENPP1_log2 = median(ENPP1_log2, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+############################################################
+## 5. Merge
+############################################################
+
+dat <- clin %>%
+  left_join(brca_mut_status, by = "patient12") %>%
+  left_join(
+    as.data.frame(brca1_meth_status),
+    by = "patient12"
+  ) %>%
+  left_join(enpp1_expr, by = "patient12") %>%
+  mutate(
+
+    BRCA1_mut = ifelse(is.na(BRCA1_mut), FALSE, BRCA1_mut),
+    BRCA2_mut = ifelse(is.na(BRCA2_mut), FALSE, BRCA2_mut),
+
+    BRCA1_promoter_hypermethylated =
+      ifelse(
+        is.na(BRCA1_promoter_hypermethylated),
+        FALSE,
+        BRCA1_promoter_hypermethylated
+      ),
+
+    ########################################################
+    ## BRCA1
+    ########################################################
+
+    BRCA1_nonfunctional =
+      BRCA1_mut |
+      BRCA1_promoter_hypermethylated,
+
+    BRCA1_group =
+      ifelse(
+        BRCA1_nonfunctional,
+        "Nonfunctional",
+        "Functional"
+      ),
+
+    ########################################################
+    ## BRCA1/2
+    ########################################################
+
+    BRCA12_nonfunctional =
+      BRCA1_mut |
+      BRCA2_mut |
+      BRCA1_promoter_hypermethylated,
+
+    BRCA12_group =
+      ifelse(
+        BRCA12_nonfunctional,
+        "Nonfunctional",
+        "Functional"
+      ),
+
+    ########################################################
+    ## basal only
+    ########################################################
+
+    is_basal =
+      grepl("basal", SUBTYPE, ignore.case = TRUE)
+
+  ) %>%
+  filter(
+    is_basal == TRUE,
+    !is.na(ENPP1_log2)
+  )
+
+############################################################
+## counts
+############################################################
+
+cat("\nBRCA1 functional groups:\n")
+print(table(dat$BRCA1_group))
+
+cat("\nBRCA1/2 functional groups:\n")
+print(table(dat$BRCA12_group))
+
+############################################################
+## 6. plotting function
+############################################################
+
+plot_functional_group <- function(
+    df,
+    group_col,
+    title_txt,
+    outname
+) {
+
+  d <- df %>%
+    filter(!is.na(.data[[group_col]]))
+
+  d[[group_col]] <- factor(
+    d[[group_col]],
+    levels = c("Functional", "Nonfunctional")
+  )
+
+  pval <- wilcox.test(
+    ENPP1_log2 ~ .data[[group_col]],
+    data = d
+  )$p.value
+
+  n_func <- sum(d[[group_col]] == "Functional")
+  n_non  <- sum(d[[group_col]] == "Nonfunctional")
+
+  p <- ggplot(
+    d,
+    aes(
+      x = .data[[group_col]],
+      y = ENPP1_log2,
+      fill = .data[[group_col]]
+    )
+  ) +
+
+    geom_violin(
+      trim = FALSE,
+      alpha = 0.35,
+      color = NA
+    ) +
+
+    geom_boxplot(
+      width = 0.18,
+      outlier.shape = NA,
+      alpha = 0.85
+    ) +
+
+    geom_jitter(
+      width = 0.12,
+      size = 1.6,
+      alpha = 0.65
+    ) +
+
+    scale_fill_manual(
+      values = c(
+        "Functional" = "#00BFC4",
+        "Nonfunctional" = "#F8766D"
+      )
+    ) +
+
+    labs(
+      title = title_txt,
+      subtitle = paste0(
+        "Wilcoxon p = ",
+        signif(pval, 3)
+      ),
+      x = "",
+      y = expression(italic("ENPP1") ~ "expression")
+    ) +
+
+    annotate(
+      "text",
+      x = 1,
+      y = min(d$ENPP1_log2),
+      label = paste0("n=", n_func),
+      size = 5
+    ) +
+
+    annotate(
+      "text",
+      x = 2,
+      y = min(d$ENPP1_log2),
+      label = paste0("n=", n_non),
+      size = 5
+    ) +
+
+    theme_classic(base_size = 15) +
+
+    theme(
+      legend.position = "none",
+      plot.title = element_text(
+        hjust = 0.5,
+        face = "bold"
+      )
+    )
+
+  ggsave(
+    file.path(outdir, outname),
+    p,
+    width = 4.8,
+    height = 5.2
+  )
+
+  return(p)
+
+}
+
+############################################################
+## 7. BRCA1
+############################################################
+
+plot_functional_group(
+  dat,
+  "BRCA1_group",
+  "TCGA: basal-like BC",
+  "Basal_ENPP1_BRCA1_functional_vs_nonfunctional.pdf"
+)
+
+############################################################
+## 8. BRCA1/2
+############################################################
+
+plot_functional_group(
+  dat,
+  "BRCA12_group",
+  "TCGA: basal-like BC",
+  "Basal_ENPP1_BRCA12_functional_vs_nonfunctional.pdf"
+)
+
+############################################################
+## export table
+############################################################
+
+write.csv(
+  dat,
+  file.path(
+    outdir,
+    "Basal_ENPP1_BRCA_functional_patient_table.csv"
+  ),
+  row.names = FALSE
+)
+
+cat("\nDone.\n")
+cat(outdir, "\n")
