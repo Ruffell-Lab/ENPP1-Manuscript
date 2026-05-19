@@ -1,0 +1,411 @@
+############################################################
+## ENPP1 median split + CIBERSORT 6-group heatmap
+## TCGA / SCANB / ISPY2
+## With p-value stars + direction arrows
+############################################################
+
+rm(list = ls())
+
+library(data.table)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(openxlsx)
+library(stringr)
+library(scales)
+
+############################################################
+## 0. Output folder
+############################################################
+
+outdir <- "~/Desktop/Cibersort_heatmap/ENPP1_CIBERSORT_final_heatmap_direction"
+dir.create(outdir, recursive = TRUE, showWarnings = FALSE)
+
+############################################################
+## 1. Select files
+############################################################
+
+message("Select TCGA expression file")
+tcga_expr_file <- file.choose()
+
+message("Select TCGA CIBERSORT result file")
+tcga_cib_file <- file.choose()
+
+message("Select SCANB expression file")
+scanb_expr_file <- file.choose()
+
+message("Select SCANB CIBERSORT result file")
+scanb_cib_file <- file.choose()
+
+message("Select ISPY2 expression file")
+ispy2_expr_file <- file.choose()
+
+message("Select ISPY2 CIBERSORT result file")
+ispy2_cib_file <- file.choose()
+
+############################################################
+## 2. Helper functions
+############################################################
+
+read_expr_get_enpp1 <- function(expr_file, cohort_name) {
+  
+  expr <- fread(expr_file, data.table = FALSE, check.names = FALSE)
+  colnames(expr)[1] <- "gene"
+  expr$gene <- as.character(expr$gene)
+  
+  enpp1_rows <- expr[toupper(expr$gene) == "ENPP1", , drop = FALSE]
+  
+  if (nrow(enpp1_rows) == 0) {
+    stop(paste0("ENPP1 not found in ", cohort_name))
+  }
+  
+  enpp1_mat <- enpp1_rows[, -1, drop = FALSE]
+  enpp1_mat[] <- lapply(enpp1_mat, function(x) as.numeric(as.character(x)))
+  
+  enpp1_value <- colMeans(enpp1_mat, na.rm = TRUE)
+  
+  enpp1_df <- data.frame(
+    sample = names(enpp1_value),
+    ENPP1 = as.numeric(enpp1_value),
+    stringsAsFactors = FALSE
+  )
+  
+  enpp1_df <- enpp1_df[!is.na(enpp1_df$ENPP1), ]
+  
+  med <- median(enpp1_df$ENPP1, na.rm = TRUE)
+  
+  enpp1_df$ENPP1_group <- ifelse(enpp1_df$ENPP1 >= med, "High", "Low")
+  enpp1_df$cohort <- cohort_name
+  
+  return(enpp1_df)
+}
+
+read_cibersort <- function(cib_file, cohort_name) {
+  
+  cib <- fread(cib_file, data.table = FALSE, check.names = FALSE)
+  colnames(cib)[1] <- "sample"
+  cib$sample <- as.character(cib$sample)
+  cib$cohort <- cohort_name
+  
+  return(cib)
+}
+
+clean_sample_id <- function(x, cohort_name) {
+  
+  x <- as.character(x)
+  
+  if (cohort_name == "TCGA") {
+    x <- substr(x, 1, 15)
+  }
+  
+  return(x)
+}
+
+get_star <- function(p) {
+  ifelse(is.na(p), "",
+         ifelse(p < 0.0001, "****",
+                ifelse(p < 0.001, "***",
+                       ifelse(p < 0.01, "**",
+                              ifelse(p < 0.05, "*", "")))))
+}
+
+analyze_one_cohort <- function(expr_file, cib_file, cohort_name) {
+  
+  message("Processing ", cohort_name)
+  
+  enpp1 <- read_expr_get_enpp1(expr_file, cohort_name)
+  cib <- read_cibersort(cib_file, cohort_name)
+  
+  enpp1$sample_clean <- clean_sample_id(enpp1$sample, cohort_name)
+  cib$sample_clean <- clean_sample_id(cib$sample, cohort_name)
+  
+  dat <- inner_join(cib, enpp1, by = "sample_clean")
+  
+  if (nrow(dat) == 0) {
+    stop(paste0("No matched samples for ", cohort_name))
+  }
+  
+  immune_cols <- setdiff(
+    colnames(cib),
+    c("sample", "P-value", "Correlation", "RMSE", "cohort", "sample_clean")
+  )
+  
+  immune_cols <- immune_cols[immune_cols %in% colnames(dat)]
+  
+  stat <- lapply(immune_cols, function(cell) {
+    
+    tmp <- dat[, c("ENPP1_group", cell)]
+    colnames(tmp) <- c("group", "value")
+    tmp$value <- as.numeric(tmp$value)
+    tmp <- tmp[!is.na(tmp$value) & tmp$group %in% c("High", "Low"), ]
+    
+    n_high <- sum(tmp$group == "High")
+    n_low  <- sum(tmp$group == "Low")
+    
+    mean_high <- mean(tmp$value[tmp$group == "High"], na.rm = TRUE)
+    mean_low  <- mean(tmp$value[tmp$group == "Low"], na.rm = TRUE)
+    diff_mean <- mean_high - mean_low
+    
+    pval <- NA
+    
+    if (n_high >= 3 && n_low >= 3 && length(unique(tmp$value)) > 1) {
+      pval <- tryCatch(
+        wilcox.test(value ~ group, data = tmp)$p.value,
+        error = function(e) NA
+      )
+    }
+    
+    data.frame(
+      cohort = cohort_name,
+      immune_cell = cell,
+      n_high = n_high,
+      n_low = n_low,
+      mean_high = mean_high,
+      mean_low = mean_low,
+      diff_high_minus_low = diff_mean,
+      p_value = pval,
+      star = get_star(pval),
+      stringsAsFactors = FALSE
+    )
+  }) %>% bind_rows()
+  
+  stat <- stat %>%
+    mutate(
+      direction = case_when(
+        is.na(diff_high_minus_low) ~ "",
+        diff_high_minus_low > 0 ~ "↑",
+        diff_high_minus_low < 0 ~ "↓",
+        TRUE ~ ""
+      ),
+      label = ifelse(star == "", "", paste0(star, " ", direction))
+    )
+  
+  return(list(dat = dat, stat = stat))
+}
+
+############################################################
+## 3. Run all cohorts
+############################################################
+
+tcga_res  <- analyze_one_cohort(tcga_expr_file,  tcga_cib_file,  "TCGA")
+scanb_res <- analyze_one_cohort(scanb_expr_file, scanb_cib_file, "SCANB")
+ispy2_res <- analyze_one_cohort(ispy2_expr_file, ispy2_cib_file, "ISPY2")
+
+all_stat <- bind_rows(
+  tcga_res$stat,
+  scanb_res$stat,
+  ispy2_res$stat
+)
+
+############################################################
+## 4. Make group means
+############################################################
+
+make_group_mean <- function(dat, cohort_name) {
+  
+  immune_cols <- grep(
+    "B cells|Plasma|T cells|NK cells|Monocytes|Macrophages|Dendritic|Mast|Eosinophils|Neutrophils",
+    colnames(dat),
+    value = TRUE
+  )
+  
+  dat %>%
+    select(ENPP1_group, all_of(immune_cols)) %>%
+    pivot_longer(
+      cols = all_of(immune_cols),
+      names_to = "immune_cell",
+      values_to = "fraction"
+    ) %>%
+    mutate(fraction = as.numeric(fraction)) %>%
+    group_by(immune_cell, ENPP1_group) %>%
+    summarise(
+      mean_fraction = mean(fraction, na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    mutate(
+      cohort = cohort_name,
+      group_label = paste0(cohort_name, "_", ENPP1_group)
+    )
+}
+
+mean_df <- bind_rows(
+  make_group_mean(tcga_res$dat, "TCGA"),
+  make_group_mean(scanb_res$dat, "SCANB"),
+  make_group_mean(ispy2_res$dat, "ISPY2")
+)
+
+############################################################
+## 5. Row-scaled value for visualization
+############################################################
+
+mean_df <- mean_df %>%
+  group_by(immune_cell) %>%
+  mutate(
+    scaled_fraction = as.numeric(scale(mean_fraction))
+  ) %>%
+  ungroup()
+
+mean_df$scaled_fraction[is.na(mean_df$scaled_fraction)] <- 0
+
+############################################################
+## 6. Add stars + direction to High column
+############################################################
+
+star_df <- all_stat %>%
+  mutate(
+    ENPP1_group = "High",
+    group_label = paste0(cohort, "_High")
+  ) %>%
+  select(cohort, immune_cell, group_label, star, direction, label,
+         p_value, diff_high_minus_low)
+
+plot_df_6 <- mean_df %>%
+  left_join(star_df, by = c("cohort", "immune_cell", "group_label")) %>%
+  mutate(
+    label = ifelse(is.na(label), "", label),
+    group_label = factor(
+      group_label,
+      levels = c(
+        "TCGA_Low", "TCGA_High",
+        "SCANB_Low", "SCANB_High",
+        "ISPY2_Low", "ISPY2_High"
+      )
+    ),
+    immune_cell = factor(immune_cell, levels = rev(unique(immune_cell)))
+  )
+
+############################################################
+## 7. Plot 6-group heatmap
+############################################################
+
+p6 <- ggplot(
+  plot_df_6,
+  aes(x = group_label, y = immune_cell, fill = scaled_fraction)
+) +
+  geom_tile(color = "white", linewidth = 0.5) +
+  geom_text(
+    aes(label = label),
+    size = 3.8,
+    fontface = "bold",
+    color = "black"
+  ) +
+  scale_fill_gradient2(
+    low = "#00BFC4",
+    mid = "white",
+    high = "#F8766D",
+    midpoint = 0,
+    limits = c(-1.8, 1.8),
+    oob = scales::squish,
+    name = "Row-scaled\nmean fraction"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    axis.title = element_blank(),
+    axis.text.x = element_text(
+      size = 11,
+      face = "bold",
+      angle = 45,
+      hjust = 1
+    ),
+    axis.text.y = element_text(size = 10),
+    panel.grid = element_blank(),
+    legend.title = element_text(size = 11),
+    legend.text = element_text(size = 10),
+    plot.title = element_text(size = 15, face = "bold", hjust = 0.5)
+  ) +
+  ggtitle("CIBERSORT immune fractions by ENPP1 Low/High groups")
+
+ggsave(
+  file.path(outdir, "ENPP1_low_high_6group_CIBERSORT_heatmap_with_direction.pdf"),
+  p6,
+  width = 9,
+  height = 8
+)
+
+ggsave(
+  file.path(outdir, "ENPP1_low_high_6group_CIBERSORT_heatmap_with_direction.png"),
+  p6,
+  width = 9,
+  height = 8,
+  dpi = 300
+)
+
+############################################################
+## 8. Also plot direction-only effect heatmap
+## color = High - Low directly
+############################################################
+
+effect_df <- all_stat %>%
+  mutate(
+    cohort = factor(cohort, levels = c("TCGA", "SCANB", "ISPY2")),
+    immune_cell = factor(immune_cell, levels = rev(unique(immune_cell)))
+  )
+
+p_effect <- ggplot(
+  effect_df,
+  aes(x = cohort, y = immune_cell, fill = diff_high_minus_low)
+) +
+  geom_tile(color = "white", linewidth = 0.5) +
+  geom_text(
+    aes(label = label),
+    size = 3.8,
+    fontface = "bold",
+    color = "black"
+  ) +
+  scale_fill_gradient2(
+    low = "#00BFC4",
+    mid = "white",
+    high = "#F8766D",
+    midpoint = 0,
+    name = "Mean difference\nHigh - Low"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    axis.title = element_blank(),
+    axis.text.x = element_text(size = 12, face = "bold"),
+    axis.text.y = element_text(size = 10),
+    panel.grid = element_blank(),
+    legend.title = element_text(size = 11),
+    legend.text = element_text(size = 10),
+    plot.title = element_text(size = 15, face = "bold", hjust = 0.5)
+  ) +
+  ggtitle("Direction of immune change in ENPP1 High vs Low")
+
+ggsave(
+  file.path(outdir, "ENPP1_high_minus_low_CIBERSORT_effect_heatmap_with_direction.pdf"),
+  p_effect,
+  width = 7,
+  height = 8
+)
+
+ggsave(
+  file.path(outdir, "ENPP1_high_minus_low_CIBERSORT_effect_heatmap_with_direction.png"),
+  p_effect,
+  width = 7,
+  height = 8,
+  dpi = 300
+)
+
+############################################################
+## 9. Export tables
+############################################################
+
+write.xlsx(
+  list(
+    TCGA_merged = tcga_res$dat,
+    SCANB_merged = scanb_res$dat,
+    ISPY2_merged = ispy2_res$dat,
+    All_statistics = all_stat,
+    Six_group_plot_data = plot_df_6,
+    Effect_heatmap_data = effect_df
+  ),
+  file = file.path(outdir, "ENPP1_CIBERSORT_statistics_with_direction.xlsx"),
+  overwrite = TRUE
+)
+
+############################################################
+## 10. Finish
+############################################################
+
+message("Done!")
+message("Results saved to: ", outdir)
